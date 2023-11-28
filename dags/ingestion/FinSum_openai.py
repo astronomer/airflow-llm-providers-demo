@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowException
-from include.utils.weaviate.hooks.weaviate import _WeaviateHook
+from airflow.providers.openai.hooks.openai import OpenAIHook
 
 from bs4 import BeautifulSoup
 import datetime
-import json
 from langchain.schema import Document
 from langchain.text_splitter import (
     HTMLHeaderTextSplitter,
@@ -17,19 +16,15 @@ import pandas as pd
 from pathlib import Path
 import requests
 import unicodedata
+import uuid
 
 logger = logging.getLogger("airflow.task")
 
 edgar_headers={"User-Agent": "test1@test1.com"}
 
-weaviate_hook = _WeaviateHook("weaviate_default")
-weaviate_client = weaviate_hook.get_client()
-
-class_name = "tenQ"
+openai_hook = OpenAIHook("openai_default")
 
 tickers = ["f", "tsla"]
-
-schema_file = Path("include/data/schema.json")
 
 default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
 
@@ -41,31 +36,17 @@ default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
     is_paused_upon_creation=True,
     default_args=default_args,
 )
-def FinSum_Weaviate():
+def FinSum_OpenAI():
     """
     This DAG extracts and splits financial reporting data from the US 
-    [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and ingests 
-    the data to a Weaviate vector database.
+    [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and generates 
+    vector embeddings with openai embeddings model.
+
+    With very large datasets it may not be convenient to store embeddings in a vector database.  This DAG
+    shows how to save documents with vectors on disk. Realistically these would be serialized in cloud object 
+    storage but for the purpose of demo we store them on local disk.
+
     """
-
-    def check_schema() -> str:
-        """
-        Check if the current schema includes the requested schema.  The current schema could be a superset
-        so check_schema_subset is used recursively to check that all objects in the requested schema are
-        represented in the current schema.
-        """
-
-        class_objects = json.loads(schema_file.read_text())
-
-        return (
-            ["extract_edgar_html"]
-            if weaviate_hook.check_schema(class_objects=class_objects)
-            else ["create_schema"]
-        )
-
-    def create_schema(existing: str = "ignore"):
-        class_objects = json.loads(schema_file.read_text())
-        weaviate_hook.create_schema(class_objects=class_objects, existing=existing)
 
     def remove_tables(content:str):
         """
@@ -238,50 +219,36 @@ def FinSum_Weaviate():
 
         return df
 
-    def weaviate_ingest(
-        dfs: list[pd.DataFrame],
-        class_name: str,
-    ):
+    def vectorize( dfs: list[pd.DataFrame], output_file_name: Path) -> str:
         """
-        This task concatenates multiple dataframes from upstream dynamic tasks and vectorizes with import to weaviate.
-
-        Upsert logic relies on a 'doc_key' which is a uniue representation of the document.  Because documents can
-        be represented as multiple chunks (each with a UUID which is unique in the DB) the doc_key is a way to represent
-        all chunks associated with an ingested document.
+        This task concatenates multiple dataframes from upstream dynamic tasks and vectorizes with OpenAI Embeddings.
 
         :param dfs: A list of dataframes from downstream dynamic tasks
-        :param class_name: The name of the class to import data.  Class should be created with weaviate schema.
-            type class_name: str
+        :param output_file_name: Path for saving embeddings
+        :return: Location of saved file
         """
 
         df = pd.concat(dfs, ignore_index=True)
 
-        df, uuid_column = weaviate_hook.generate_uuids(df=df, class_name=class_name)
+        df["id"] = df.content.apply(lambda x: str(uuid.uuid5(name=x, namespace=uuid.NAMESPACE_DNS)))
 
-        weaviate_hook.ingest_data(
-            df=df, 
-            class_name=class_name, 
-            existing="skip",
-            doc_key="docLink",
-            uuid_column=uuid_column,
-            batch_params={"batch_size": 100},
-            verbose=True
-        )
+        df["vector"] = df.content.apply(
+            lambda x: openai_hook.create_embeddings(text=x, model="text-embedding-ada-002")
+            )
+        
+        df.to_parquet(output_file_name)
 
-    _check_schema = task.branch(check_schema)()
-    
-    _create_schema = task(create_schema)(existing="ignore")
+        return output_file_name
 
     edgar_docs = task(extract).expand(ticker=tickers)
 
     split_docs = task(split).expand(dfs=[edgar_docs])
-    
-    imported_data = (
-        task(weaviate_ingest, retries=10)
-        .partial(class_name=class_name)
+
+    embeddings_file = (
+        task(vectorize)
+        .partial(output_file_name='include/data/html/openai_embeddings.parquet')
         .expand(dfs=[split_docs])
     )
 
-    _check_schema >> _create_schema >> edgar_docs
 
-FinSum_Weaviate()
+FinSum_OpenAI()
