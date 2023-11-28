@@ -262,7 +262,7 @@ def FinSum_PgVector():
 
         df["id"] = df.content.apply(
             lambda x: str(uuid.uuid5(
-                name=x+index_name, namespace=uuid.NAMESPACE_DNS)
+                name=x, namespace=uuid.NAMESPACE_DNS)
             )
         )
 
