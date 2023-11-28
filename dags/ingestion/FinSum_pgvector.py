@@ -249,7 +249,6 @@ def FinSum_PgVector():
 
     def pgvector_ingest(
         dfs: list[pd.DataFrame],
-        index_name: str,
     ):
         """
         This task concatenates multiple dataframes from upstream dynamic tasks and vectorizes 
@@ -291,7 +290,6 @@ def FinSum_PgVector():
 
     imported_data = (
         task(pgvector_ingest, retries=10)
-        .partial(table_name=table_name)
         .expand(dfs=[split_docs])
     )
 
