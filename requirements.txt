@@ -1,0 +1,7 @@
+apache-airflow-providers-weaviate==1.0.0
+apache-airflow-providers-pinecone==1.0.0
+apache-airflow-providers-pgvector==1.0.0
+apache-airflow-providers-cohere==1.0.0
+apache-airflow-providers-openai==1.0.0
+bs4==0.0.1
+langchain==0.0.341

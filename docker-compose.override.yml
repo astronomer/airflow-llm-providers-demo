@@ -1,0 +1,28 @@
+version: '3.1'
+services:
+  weaviate:
+    image: semitechnologies/weaviate:1.21.0
+    command: "--host 0.0.0.0 --port '8081' --scheme http"
+    # volumes:
+    # - ${PWD}/include/weaviate/backup:/var/lib/weaviate/backup
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
+      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
+      DEFAULT_VECTORIZER_MODULE: 'text2vec-openai'
+      ENABLE_MODULES: 'text2vec-openai, backup-filesystem, qna-openai, generative-openai, text2vec-cohere'
+      BACKUP_FILESYSTEM_PATH: '/var/lib/weaviate/backup'
+      CLUSTER_HOSTNAME: 'node1'
+    ports:
+    - 8081:8081
+    networks:
+    - airflow
+  pgvector:
+    image: ankane/pgvector
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - 5433:5432
+    networks:
+      - airflow
