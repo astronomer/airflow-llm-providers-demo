@@ -48,9 +48,7 @@ def FinSum_Pinecone():
 
     def check_index() -> [str]:
         """
-        Check if the current schema includes the requested schema.  The current schema could be a superset
-        so check_schema_subset is used recursively to check that all objects in the requested schema are
-        represented in the current schema.
+        Check if an index exists with correct parameters.
         """
 
         if index_name in pinecone_hook.list_indexes():

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowException
-from airflow.providers.cohere.hooks.cohere import CohereHook
+from airflow.providers.pgvector.hooks.pgvector import PgVectorHook
+from airflow.providers.openai.hooks.openai import OpenAIHook
 
 from bs4 import BeautifulSoup
 import datetime
@@ -13,7 +14,6 @@ from langchain.text_splitter import (
 )
 import logging
 import pandas as pd
-from pathlib import Path
 import requests
 import unicodedata
 import uuid
@@ -22,7 +22,10 @@ logger = logging.getLogger("airflow.task")
 
 edgar_headers={"User-Agent": "test1@test1.com"}
 
-cohere_hook = CohereHook("cohere_default")
+pgvector_hook = PgVectorHook("postgres_default")
+openai_hook = OpenAIHook("openai_default")
+
+table_name="tenq"
 
 tickers = ["f", "tsla"]
 
@@ -36,17 +39,42 @@ default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
     is_paused_upon_creation=True,
     default_args=default_args,
 )
-def FinSum_Cohere():
+def FinSum_PgVector():
     """
     This DAG extracts and splits financial reporting data from the US 
-    [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and generates 
-    vector embeddings with cohere embeddings.
-
-    With very large datasets it may not be convenient to store embeddings in a vector database.  This DAG
-    shows how to save documents with vectors on disk. Realistically these would be serialized in cloud object 
-    storage but for the purpose of demo we store them on local disk.
-
+    [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and ingests 
+    the data to a PgVector vector database.
     """
+
+    def check_table() -> [str]:
+        """
+        Check if a table exists.
+        """
+
+        if pgvector_hook.get_records(
+            f"""SELECT * FROM pg_catalog.pg_tables
+                WHERE schemaname = 'public' 
+                AND tablename = '{table_name}';"""):
+            return ["extract_edgar_html"]
+        else:
+            return ["create_table"]
+
+    def create_table():
+
+        pgvector_hook.create_extension('vector')
+
+        pgvector_hook.create_table(
+            table_name=table_name,
+            columns=[
+                "id UUID PRIMARY KEY",
+                "docLink TEXT",
+                "ticker TEXT",
+                "cik_number TEXT",
+                "fiscal_year TEXT",
+                "fiscal_period TEXT",
+                "vector VECTOR(1536)"
+            ]   
+        )
 
     def remove_tables(content:str):
         """
@@ -219,38 +247,54 @@ def FinSum_Cohere():
 
         return df
 
-    def vectorize(dfs: list[pd.DataFrame], output_file_name: Path) -> str:
+    def pgvector_ingest(
+        dfs: list[pd.DataFrame],
+        index_name: str,
+    ):
         """
         This task concatenates multiple dataframes from upstream dynamic tasks and vectorizes 
-        with Cohere Embeddings.  The vectorized dataset is written to disk.
+        with import to a pgvector database.
 
         :param dfs: A list of dataframes from downstream dynamic tasks
-        :param output_file_name: Path for saving embeddings
-        :return: Location of saved file
+        :param index_name: The name of the index to import data. 
         """
 
         df = pd.concat(dfs, ignore_index=True)
 
-        df["id"] = df.content.apply(lambda x: str(uuid.uuid5(name=x, namespace=uuid.NAMESPACE_DNS)))
+        df["id"] = df.content.apply(
+            lambda x: str(uuid.uuid5(
+                name=x+index_name, namespace=uuid.NAMESPACE_DNS)
+            )
+        )
 
         df["vector"] = df.content.apply(
-            lambda x: cohere_hook.create_embeddings(
-                texts=[x], model="embed-multilingual-v2.0"
-                )[0]
+            lambda x: list(
+                openai_hook.create_embeddings(
+                    text=x, model="text-embedding-ada-002")
+                )
             )
         
-        df.to_parquet(output_file_name)
+        df.drop('content', axis=1).to_sql(
+            name=table_name, 
+            con=pgvector_hook.get_sqlalchemy_engine(), 
+            if_exists='replace', 
+            chunksize=1000
+        )
+        
+    _check_index = task.branch(check_table)()
 
-        return output_file_name
+    _create_index = task(create_table)()
 
     edgar_docs = task(extract).expand(ticker=tickers)
 
     split_docs = task(split).expand(dfs=[edgar_docs])
 
-    embeddings_file = (
-        task(vectorize)
-        .partial(output_file_name='include/data/html/cohere_embeddings.parquet')
+    imported_data = (
+        task(pgvector_ingest, retries=10)
+        .partial(table_name=table_name)
         .expand(dfs=[split_docs])
     )
 
-FinSum_Cohere()
+    _check_index >> _create_index >> edgar_docs
+
+FinSum_PgVector()
