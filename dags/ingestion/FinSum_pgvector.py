@@ -55,7 +55,7 @@ def FinSum_PgVector():
             f"""SELECT * FROM pg_catalog.pg_tables
                 WHERE schemaname = 'public' 
                 AND tablename = '{table_name}';"""):
-            return ["extract_edgar_html"]
+            return ["extract"]
         else:
             return ["create_table"]
 
