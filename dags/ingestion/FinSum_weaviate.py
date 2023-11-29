@@ -3,6 +3,7 @@ from __future__ import annotations
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowException
 from include.utils.weaviate.hooks.weaviate import _WeaviateHook
+from airflow.providers.openai.hooks.openai import OpenAIHook
 
 from bs4 import BeautifulSoup
 import datetime
@@ -13,6 +14,7 @@ from langchain.text_splitter import (
     RecursiveCharacterTextSplitter,
 )
 import logging
+import openai as openai_client
 import pandas as pd
 from pathlib import Path
 import requests
@@ -22,14 +24,17 @@ logger = logging.getLogger("airflow.task")
 
 edgar_headers={"User-Agent": "test1@test1.com"}
 
+openai_hook = OpenAIHook("openai_default")
+openai_client.api_key = openai_hook._get_api_key()
+
 weaviate_hook = _WeaviateHook("weaviate_default")
 weaviate_client = weaviate_hook.get_client()
 
-class_name = "tenQ"
+class_names = ["TenQ", "TenQSummary"]
 
 tickers = ["f", "tsla"]
 
-schema_file = Path("include/data/schema.json")
+schema_file = Path("include/data/weaviate_schema.json")
 
 default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
 
@@ -45,12 +50,13 @@ def FinSum_Weaviate():
     """
     This DAG extracts and splits financial reporting data from the US 
     [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and ingests 
-    the data to a Weaviate vector database.
+    the data to a Weaviate vector database for generative question answering.  The DAG also 
+    creates and vectorizes summarizations of the 10-Q document.
     """
 
-    def check_schema() -> str:
+    def check_schemas() -> str:
         """
-        Check if the current schema includes the requested schema.  The current schema could be a superset
+        Check if the current schema includes the requested schemas.  The current schema could be a superset
         so check_schema_subset is used recursively to check that all objects in the requested schema are
         represented in the current schema.
         """
@@ -58,14 +64,17 @@ def FinSum_Weaviate():
         class_objects = json.loads(schema_file.read_text())
 
         return (
-            ["extract_edgar_html"]
+            ["extract"]
             if weaviate_hook.check_schema(class_objects=class_objects)
-            else ["create_schema"]
+            else ["create_schemas"]
         )
 
-    def create_schema(existing: str = "ignore"):
+    def create_schemas():
+        """
+        Creates the weaviate class schemas.
+        """
         class_objects = json.loads(schema_file.read_text())
-        weaviate_hook.create_schema(class_objects=class_objects, existing=existing)
+        weaviate_hook.create_schema(class_objects=class_objects, existing="ignore")
 
     def remove_tables(content:str):
         """
@@ -219,7 +228,7 @@ def FinSum_Weaviate():
 
         html_splitter = HTMLHeaderTextSplitter(headers_to_split_on)
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=4000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
+            chunk_size=10000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
             )
 
         df["doc_chunks"] = df["content"].apply(lambda x: html_splitter.split_text(text=x))
@@ -268,19 +277,82 @@ def FinSum_Weaviate():
             verbose=True
         )
 
-    _check_schema = task.branch(check_schema)()
+        return df[["docLink", "content", uuid_column]]
+
+    def chunk_summarization_openai(content: str):
+        
+        response = openai_client.ChatCompletion().create(
+            model="gpt-3.5-turbo-1106",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a highly skilled AI trained in language comprehension and summarization. I would like you to read the following text and summarize it into a concise abstract paragraph. Aim to retain the most important points, providing a coherent and readable summary that could help a person understand the main points of the discussion without needing to read the entire text. Please avoid unnecessary details or tangential points."
+                },
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ],
+            temperature=0,
+            max_tokens=1000
+            )
+        if content:=response.get("choices")[0].get("message").get("content"):
+            return content
+        else:
+            return None
     
-    _create_schema = task(create_schema)(existing="ignore")
+    def doc_summarization_openai(content: str):
+        
+        response = openai_client.ChatCompletion().create(
+            model="gpt-4-1106-preview",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a highly skilled AI trained in language comprehension and summarization. I would like you to read the following text and summarize it into a concise abstract paragraph. Aim to retain the most important points, providing a coherent and readable summary that could help a person understand the main points of the discussion without needing to read the entire text. Please avoid unnecessary details or tangential points."
+                },
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ],
+            temperature=0,
+            max_tokens=1000
+            )
+        if content:=response.get("choices")[0].get("message").get("content"):
+            return content
+        else:
+            return None
+        
+    def summarize_openai(dfs: [pd.DataFrame]) -> pd.DataFrame:
+
+        df = pd.concat(dfs, ignore_index=True)
+
+        df["chunk_summary"] = df.content.apply(chunk_summarization_openai)
+
+        summaries_df = df.groupby("docLink").chunk_summary.apply("\n".join).reset_index()
+        summaries_df["summary"] = summaries_df.chunk_summary.apply(doc_summarization_openai)
+        summaries_df.drop("chunk_summary", axis=1, inplace=True)
+
+        summary_df = df.drop(["content", "chunk_summary", "id"], axis=1).drop_duplicates().merge(summaries_df)
+        summary_df.iloc[0]
+
+    _check_schema = task.branch(check_schemas)()
+    
+    _create_schema = task(create_schemas)()
 
     edgar_docs = task(extract).expand(ticker=tickers)
 
     split_docs = task(split).expand(dfs=[edgar_docs])
     
-    imported_data = (
-        task(weaviate_ingest, retries=10)
-        .partial(class_name=class_name)
+    task(weaviate_ingest, task_id="import_chunks", retries=10)\
+        .partial(class_name=class_names[0])\
         .expand(dfs=[split_docs])
-    )
+
+    generate_summary = task(summarize_openai).expand(dfs=[split_docs])
+
+    task(weaviate_ingest, task_id="import_summary", retries=10)\
+        .partial(class_name=class_names[1])\
+        .expand(dfs=[generate_summary])
 
     _check_schema >> _create_schema >> edgar_docs
 

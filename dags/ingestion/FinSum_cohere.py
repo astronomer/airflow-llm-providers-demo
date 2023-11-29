@@ -40,7 +40,8 @@ def FinSum_Cohere():
     """
     This DAG extracts and splits financial reporting data from the US 
     [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and generates 
-    vector embeddings with cohere embeddings.
+    vector embeddings with cohere embeddings for generative question answering.  The DAG also 
+    creates and vectorizes summarizations of the 10-Q document.
 
     With very large datasets it may not be convenient to store embeddings in a vector database.  This DAG
     shows how to save documents with vectors on disk. Realistically these would be serialized in cloud object 

@@ -12,6 +12,7 @@ from langchain.text_splitter import (
     RecursiveCharacterTextSplitter,
 )
 import logging
+import openai as openai_client
 import pandas as pd
 from pathlib import Path
 import requests
@@ -23,6 +24,7 @@ logger = logging.getLogger("airflow.task")
 edgar_headers={"User-Agent": "test1@test1.com"}
 
 openai_hook = OpenAIHook("openai_default")
+openai_client.api_key = openai_hook._get_api_key()
 
 tickers = ["f", "tsla"]
 
@@ -40,7 +42,8 @@ def FinSum_OpenAI():
     """
     This DAG extracts and splits financial reporting data from the US 
     [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and generates 
-    vector embeddings with openai embeddings model.
+    vector embeddings with openai embeddings model for generative question answering.  The DAG also 
+    creates and vectorizes summarizations of the 10-Q document.
 
     With very large datasets it may not be convenient to store embeddings in a vector database.  This DAG
     shows how to save documents with vectors on disk. Realistically these would be serialized in cloud object 
@@ -200,7 +203,7 @@ def FinSum_OpenAI():
 
         html_splitter = HTMLHeaderTextSplitter(headers_to_split_on)
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=4000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
+            chunk_size=10000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
             )
 
         df["doc_chunks"] = df["content"].apply(lambda x: html_splitter.split_text(text=x))
@@ -240,15 +243,79 @@ def FinSum_OpenAI():
 
         return output_file_name
 
+    def chunk_summarization_openai(content: str):
+        
+        response = openai_client.ChatCompletion().create(
+            model="gpt-3.5-turbo-1106",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a highly skilled AI trained in language comprehension and summarization. I would like you to read the following text and summarize it into a concise abstract paragraph. Aim to retain the most important points, providing a coherent and readable summary that could help a person understand the main points of the discussion without needing to read the entire text. Please avoid unnecessary details or tangential points."
+                },
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ],
+            temperature=0,
+            max_tokens=1000
+            )
+        if content:=response.get("choices")[0].get("message").get("content"):
+            return content
+        else:
+            return None
+    
+    def doc_summarization_openai(content: str):
+        
+        response = openai_client.ChatCompletion().create(
+            model="gpt-4-1106-preview",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a highly skilled AI trained in language comprehension and summarization. I would like you to read the following text and summarize it into a concise abstract paragraph. Aim to retain the most important points, providing a coherent and readable summary that could help a person understand the main points of the discussion without needing to read the entire text. Please avoid unnecessary details or tangential points."
+                },
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ],
+            temperature=0,
+            max_tokens=1000
+            )
+        if content:=response.get("choices")[0].get("message").get("content"):
+            return content
+        else:
+            return None
+        
+    def summarize_openai(dfs: [pd.DataFrame]) -> pd.DataFrame:
+
+        df = pd.concat(dfs, ignore_index=True)
+
+        df["chunk_summary"] = df.content.apply(chunk_summarization_openai)
+
+        summaries_df = df.groupby("docLink").chunk_summary.apply("\n".join).reset_index()
+        summaries_df["summary"] = summaries_df.chunk_summary.apply(doc_summarization_openai)
+        summaries_df.drop("chunk_summary", axis=1, inplace=True)
+
+        summary_df = df.drop(["content", "chunk_summary", "id"], axis=1).drop_duplicates().merge(summaries_df)
+        summary_df.iloc[0]
+
     edgar_docs = task(extract).expand(ticker=tickers)
 
     split_docs = task(split).expand(dfs=[edgar_docs])
 
     embeddings_file = (
-        task(vectorize)
+        task(vectorize, task_id="vectorize_chunks")
         .partial(output_file_name='include/data/html/openai_embeddings.parquet')
         .expand(dfs=[split_docs])
     )
 
+    generate_summary = task(summarize_openai).expand(dfs=[split_docs])
+
+    embeddings_file = (
+        task(vectorize, task_id="vectorize_summaries")
+        .partial(output_file_name='include/data/html/openai_summary_embeddings.parquet')
+        .expand(dfs=[generate_summary])
+    )
 
 FinSum_OpenAI()

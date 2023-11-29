@@ -1,0 +1,210 @@
+[
+    {
+        "class": "TenQ",
+        "description": "SEC filing data form 10-Q",
+        "invertedIndexConfig": {
+            "bm25": {
+                "b": 0.75, 
+                "k1": 1.2
+            }
+        },
+        "vectorizer": "text2vec-openai",
+        "moduleConfig": {
+            "text2vec-openai": {
+                "model": "ada",
+                "modelVersion": "002",
+                "type": "text",
+                "vectorizeClassName": true
+                }
+        },
+        "properties": [
+            {
+                "name": "content",
+                "dataType": ["text"],
+                "description": "10-Q content extracted as text and split",
+                "indexFilterable": true,
+                "indexSearchable": true,
+                "moduleConfig": {
+                    "text2vec-openai": {
+                        "skip": false,
+                        "vectorizePropertyName": false
+                    }
+                },
+                "tokenization": "word"
+            },
+            {
+                "name": "docLink",
+                "dataType": ["text"],
+                "description": "Link to the 10-Q filing.",
+                "indexFilterable": true,
+                "indexSearchable": true,
+                "moduleConfig": {
+                    "text2vec-openai": {
+                        "skip": true,
+                        "vectorizePropertyName": false
+                    }
+                },
+                "tokenization": "field"
+            },
+            {
+                "name": "tickerSymbol",
+                "dataType": ["text"],
+                "description": "SEC ticker symbol for a registered company.",
+                "indexFilterable": true,
+                "indexSearchable": true,
+                "moduleConfig": {
+                    "text2vec-openai": {
+                        "skip": true,
+                        "vectorizePropertyName": false
+                    }
+                },
+                "tokenization": "word"
+            },
+            {
+                "name": "cikNumber",
+                "dataType": ["text"],
+                "description": "The SEC Central Index Key number.",
+                "indexFilterable": true,
+                "indexSearchable": true,
+                "moduleConfig": {
+                    "text2vec-openai": {
+                        "skip": true,
+                        "vectorizePropertyName": false
+                    }
+                },
+                "tokenization": "word"
+            },
+            {
+                "name": "fiscalYear",
+                "dataType": ["text"],
+                "description": "Fiscal year of the filing.",
+                "indexFilterable": true,
+                "indexSearchable": true,
+                "moduleConfig": {
+                    "text2vec-openai": {
+                        "skip": true,
+                        "vectorizePropertyName": false}
+                },
+                "tokenization": "word"
+            },
+            {
+                "name": "fiscalPeriod",
+                "dataType": ["text"],
+                "description": "Fiscal period (ie quarter name) of the filing.",
+                "indexFilterable": true,
+                "indexSearchable": true,
+                "moduleConfig": {
+                    "text2vec-openai": {
+                        "skip": true,
+                        "vectorizePropertyName": false
+                    }
+                },     
+                "tokenization": "word"
+            }
+        ]
+    },
+    {
+        "class": "TenQSummary",
+        "description": "Summarization of SEC filing data form 10-Q",
+        "invertedIndexConfig": {
+            "bm25": {
+                "b": 0.75, 
+                "k1": 1.2
+            }
+        },
+        "vectorizer": "text2vec-openai",
+        "moduleConfig": {
+            "text2vec-openai": {
+                "model": "ada",
+                "modelVersion": "002",
+                "type": "text",
+                "vectorizeClassName": true
+                }
+        },
+        "properties": [
+            {
+                "name": "summary",
+                "dataType": ["text"],
+                "description": "Summary of 10-Q recursively generated from chunks",
+                "indexFilterable": true,
+                "indexSearchable": true,
+                "moduleConfig": {
+                    "text2vec-openai": {
+                        "skip": false,
+                        "vectorizePropertyName": false
+                    }
+                },
+                "tokenization": "word"
+            },
+            {
+                "name": "docLink",
+                "dataType": ["text"],
+                "description": "Link to the 10-Q filing.",
+                "indexFilterable": true,
+                "indexSearchable": true,
+                "moduleConfig": {
+                    "text2vec-openai": {
+                        "skip": true,
+                        "vectorizePropertyName": false
+                    }
+                },
+                "tokenization": "field"
+            },
+            {
+                "name": "tickerSymbol",
+                "dataType": ["text"],
+                "description": "SEC ticker symbol for a registered company.",
+                "indexFilterable": true,
+                "indexSearchable": true,
+                "moduleConfig": {
+                    "text2vec-openai": {
+                        "skip": true,
+                        "vectorizePropertyName": false
+                    }
+                },
+                "tokenization": "word"
+            },
+            {
+                "name": "cikNumber",
+                "dataType": ["text"],
+                "description": "The SEC Central Index Key number.",
+                "indexFilterable": true,
+                "indexSearchable": true,
+                "moduleConfig": {
+                    "text2vec-openai": {
+                        "skip": true,
+                        "vectorizePropertyName": false
+                    }
+                },
+                "tokenization": "word"
+            },
+            {
+                "name": "fiscalYear",
+                "dataType": ["text"],
+                "description": "Fiscal year of the filing.",
+                "indexFilterable": true,
+                "indexSearchable": true,
+                "moduleConfig": {
+                    "text2vec-openai": {
+                        "skip": true,
+                        "vectorizePropertyName": false}
+                },
+                "tokenization": "word"
+            },
+            {
+                "name": "fiscalPeriod",
+                "dataType": ["text"],
+                "description": "Fiscal period (ie quarter name) of the filing.",
+                "indexFilterable": true,
+                "indexSearchable": true,
+                "moduleConfig": {
+                    "text2vec-openai": {
+                        "skip": true,
+                        "vectorizePropertyName": false
+                    }
+                },     
+                "tokenization": "word"
+            }
+        ]
+    }
+]

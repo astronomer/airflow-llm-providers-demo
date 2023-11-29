@@ -13,6 +13,7 @@ from langchain.text_splitter import (
     RecursiveCharacterTextSplitter,
 )
 import logging
+import openai as openai_client
 import pandas as pd
 import requests
 import unicodedata
@@ -24,8 +25,9 @@ edgar_headers={"User-Agent": "test1@test1.com"}
 
 pinecone_hook = PineconeHook("pinecone_default")
 openai_hook = OpenAIHook("openai_default")
+openai_client.api_key = openai_hook._get_api_key()
 
-index_name="tenq"
+index_names = ["tenq", "tenq-summary"]
 
 tickers = ["f", "tsla"]
 
@@ -43,49 +45,40 @@ def FinSum_Pinecone():
     """
     This DAG extracts and splits financial reporting data from the US 
     [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and ingests 
-    the data to a Pinecone vector database.
+    the data to a Pinecone vector database for generative question answering.  The DAG also 
+    creates and vectorizes summarizations of the 10-Q document.
     """
 
-    def check_index() -> [str]:
+    def check_indexes() -> [str]:
         """
-        Check if an index exists with correct parameters.
+        Check if indexes exists.
         """
-
-        if index_name in pinecone_hook.list_indexes():
-            tenq_index = pinecone_hook.describe_index(index_name=index_name)
-            try:
-                assert tenq_index.metric == "cosine"
-                assert tenq_index.replicas == 1 
-                assert tenq_index.dimension == 1536
-                assert tenq_index.shards == 1
-                assert tenq_index.pods == 1
-                assert tenq_index.pod_type == "starter"
-                assert tenq_index.status["ready"]
-                assert tenq_index.status["state"] == "Ready"
-                return ["extract_edgar_html"]
-            except Exception as e:
-                raise AirflowException(f"Index {index_name} exists and differs from requested index.")
-        else:
-            return ["create_index"]
-
-    def create_index(existing: str = "ignore"):
         
-        if index_name in pinecone_hook.list_indexes():
-            if existing == "replace":
-                pinecone_hook.delete_index(index_name=index_name)
-            elif existing == "ignore":
-                return 
+        if set(index_names).issubset(set(pinecone_hook.list_indexes())):
+                return ["extract"]
         else:
-            pinecone_hook.create_index(
-                index_name=index_name, 
-                metric="cosine", 
-                replicas=1, 
-                dimension=1536, 
-                shards=1, 
-                pods=1, 
-                pod_type='starter', 
-                source_collection='',
-            )
+            return ["create_indexes"]
+
+    def create_indexes(existing: str = "ignore"):
+        
+        for index_name in index_names:
+
+            if index_name in pinecone_hook.list_indexes():
+                if existing == "replace":
+                    pinecone_hook.delete_index(index_name=index_name)
+                elif existing == "ignore":
+                    continue 
+            else:
+                pinecone_hook.create_index(
+                    index_name=index_name, 
+                    metric="cosine", 
+                    replicas=1, 
+                    dimension=1536, 
+                    shards=1, 
+                    pods=1, 
+                    pod_type='starter', 
+                    source_collection='',
+                )
 
     def remove_tables(content:str):
         """
@@ -239,7 +232,7 @@ def FinSum_Pinecone():
 
         html_splitter = HTMLHeaderTextSplitter(headers_to_split_on)
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=4000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
+            chunk_size=10000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
             )
 
         df["doc_chunks"] = df["content"].apply(lambda x: html_splitter.split_text(text=x))
@@ -290,19 +283,80 @@ def FinSum_Pinecone():
             pool_threads=30,
             )
         
-    _check_index = task.branch(check_index)()
+    def chunk_summarization_openai(content: str):
+        
+        response = openai_client.ChatCompletion().create(
+            model="gpt-3.5-turbo-1106",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a highly skilled AI trained in language comprehension and summarization. I would like you to read the following text and summarize it into a concise abstract paragraph. Aim to retain the most important points, providing a coherent and readable summary that could help a person understand the main points of the discussion without needing to read the entire text. Please avoid unnecessary details or tangential points."
+                },
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ],
+            temperature=0,
+            max_tokens=1000
+            )
+        if content:=response.get("choices")[0].get("message").get("content"):
+            return content
+        else:
+            return None
+    
+    def doc_summarization_openai(content: str):
+        
+        response = openai_client.ChatCompletion().create(
+            model="gpt-4-1106-preview",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a highly skilled AI trained in language comprehension and summarization. I would like you to read the following text and summarize it into a concise abstract paragraph. Aim to retain the most important points, providing a coherent and readable summary that could help a person understand the main points of the discussion without needing to read the entire text. Please avoid unnecessary details or tangential points."
+                },
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ],
+            temperature=0,
+            max_tokens=1000
+            )
+        if content:=response.get("choices")[0].get("message").get("content"):
+            return content
+        else:
+            return None
+        
+    def summarize_openai(dfs: [pd.DataFrame]) -> pd.DataFrame:
 
-    _create_index = task(create_index)()
+        df = pd.concat(dfs, ignore_index=True)
+
+        df["chunk_summary"] = df.content.apply(chunk_summarization_openai)
+
+        summaries_df = df.groupby("docLink").chunk_summary.apply("\n".join).reset_index()
+        summaries_df["summary"] = summaries_df.chunk_summary.apply(doc_summarization_openai)
+        summaries_df.drop("chunk_summary", axis=1, inplace=True)
+
+        summary_df = df.drop(["content", "chunk_summary", "id"], axis=1).drop_duplicates().merge(summaries_df)
+        summary_df.iloc[0]
+
+    _check_index = task.branch(check_indexes)()
+
+    _create_index = task(create_indexes)()
 
     edgar_docs = task(extract).expand(ticker=tickers)
 
     split_docs = task(split).expand(dfs=[edgar_docs])
-
-    imported_data = (
-        task(pinecone_ingest, retries=10)
-        .partial(index_name=index_name)
+    
+    task(pinecone_ingest, task_id="import_chunks", retries=10)\
+        .partial(index_name=index_names[0])\
         .expand(dfs=[split_docs])
-    )
+
+    generate_summary = task(summarize_openai).expand(dfs=[split_docs])
+
+    task(pinecone_ingest, task_id="import_summary", retries=10)\
+        .partial(index_name=index_names[1])\
+        .expand(dfs=[generate_summary])
 
     _check_index >> _create_index >> edgar_docs
 

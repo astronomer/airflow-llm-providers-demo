@@ -13,6 +13,7 @@ from langchain.text_splitter import (
     RecursiveCharacterTextSplitter,
 )
 import logging
+import openai as openai_client
 import pandas as pd
 import requests
 import unicodedata
@@ -24,8 +25,9 @@ edgar_headers={"User-Agent": "test1@test1.com"}
 
 pgvector_hook = PgVectorHook("postgres_default")
 openai_hook = OpenAIHook("openai_default")
+openai_client.api_key = openai_hook._get_api_key()
 
-table_name="tenq"
+table_names=["tenq", "tenq_summary"]
 
 tickers = ["f", "tsla"]
 
@@ -43,38 +45,46 @@ def FinSum_PgVector():
     """
     This DAG extracts and splits financial reporting data from the US 
     [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and ingests 
-    the data to a PgVector vector database.
+    the data to a PgVector vector database for generative question answering.  The DAG also 
+    creates and vectorizes summarizations of the 10-Q document.
     """
 
-    def check_table() -> [str]:
+    def check_tables() -> [str]:
         """
-        Check if a table exists.
+        Check if tables exists.
         """
-
-        if pgvector_hook.get_records(
-            f"""SELECT * FROM pg_catalog.pg_tables
-                WHERE schemaname = 'public' 
-                AND tablename = '{table_name}';"""):
+        exists = []
+        for table_name in table_names:
+            if pgvector_hook.get_records(
+                f"""SELECT * FROM pg_catalog.pg_tables
+                    WHERE schemaname = 'public' 
+                    AND tablename = '{table_name}';"""):
+                exists.append(True)
+            else:
+                exists.append(False)
+            
+        if all(exists):
             return ["extract"]
         else:
-            return ["create_table"]
+            return ["create_tables"]
 
-    def create_table():
+    def create_tables():
 
         pgvector_hook.create_extension('vector')
 
-        pgvector_hook.create_table(
-            table_name=table_name,
-            columns=[
-                "id UUID PRIMARY KEY",
-                "docLink TEXT",
-                "ticker TEXT",
-                "cik_number TEXT",
-                "fiscal_year TEXT",
-                "fiscal_period TEXT",
-                "vector VECTOR(1536)"
-            ]   
-        )
+        for table_name in table_names:
+            pgvector_hook.create_table(
+                table_name=table_name,
+                columns=[
+                    "id UUID PRIMARY KEY",
+                    "docLink TEXT",
+                    "ticker TEXT",
+                    "cik_number TEXT",
+                    "fiscal_year TEXT",
+                    "fiscal_period TEXT",
+                    "vector VECTOR(1536)"
+                ]   
+            )
 
     def remove_tables(content:str):
         """
@@ -228,7 +238,7 @@ def FinSum_PgVector():
 
         html_splitter = HTMLHeaderTextSplitter(headers_to_split_on)
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=4000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
+            chunk_size=10000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
             )
 
         df["doc_chunks"] = df["content"].apply(lambda x: html_splitter.split_text(text=x))
@@ -249,6 +259,7 @@ def FinSum_PgVector():
 
     def pgvector_ingest(
         dfs: list[pd.DataFrame],
+        table_name: str
     ):
         """
         This task concatenates multiple dataframes from upstream dynamic tasks and vectorizes 
@@ -280,18 +291,80 @@ def FinSum_PgVector():
             chunksize=1000
         )
         
-    _check_index = task.branch(check_table)()
+    def chunk_summarization_openai(content: str):
+        
+        response = openai_client.ChatCompletion().create(
+            model="gpt-3.5-turbo-1106",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a highly skilled AI trained in language comprehension and summarization. I would like you to read the following text and summarize it into a concise abstract paragraph. Aim to retain the most important points, providing a coherent and readable summary that could help a person understand the main points of the discussion without needing to read the entire text. Please avoid unnecessary details or tangential points."
+                },
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ],
+            temperature=0,
+            max_tokens=1000
+            )
+        if content:=response.get("choices")[0].get("message").get("content"):
+            return content
+        else:
+            return None
+    
+    def doc_summarization_openai(content: str):
+        
+        response = openai_client.ChatCompletion().create(
+            model="gpt-4-1106-preview",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a highly skilled AI trained in language comprehension and summarization. I would like you to read the following text and summarize it into a concise abstract paragraph. Aim to retain the most important points, providing a coherent and readable summary that could help a person understand the main points of the discussion without needing to read the entire text. Please avoid unnecessary details or tangential points."
+                },
+                {
+                    "role": "user",
+                    "content": content
+                }
+            ],
+            temperature=0,
+            max_tokens=1000
+            )
+        if content:=response.get("choices")[0].get("message").get("content"):
+            return content
+        else:
+            return None
+        
+    def summarize_openai(dfs: [pd.DataFrame]) -> pd.DataFrame:
 
-    _create_index = task(create_table)()
+        df = pd.concat(dfs, ignore_index=True)
+
+        df["chunk_summary"] = df.content.apply(chunk_summarization_openai)
+
+        summaries_df = df.groupby("docLink").chunk_summary.apply("\n".join).reset_index()
+        summaries_df["summary"] = summaries_df.chunk_summary.apply(doc_summarization_openai)
+        summaries_df.drop("chunk_summary", axis=1, inplace=True)
+
+        summary_df = df.drop(["content", "chunk_summary", "id"], axis=1).drop_duplicates().merge(summaries_df)
+        summary_df.iloc[0]
+
+    _check_index = task.branch(check_tables)()
+
+    _create_index = task(create_tables)()
 
     edgar_docs = task(extract).expand(ticker=tickers)
 
     split_docs = task(split).expand(dfs=[edgar_docs])
 
-    imported_data = (
-        task(pgvector_ingest, retries=10)
+    task(pgvector_ingest, task_id="ingest_chunks", retries=10)\
+        .partial(table_name=table_names[0])\
         .expand(dfs=[split_docs])
-    )
+    
+    generate_summary = task(summarize_openai).expand(dfs=[split_docs])
+
+    task(pgvector_ingest, task_id="ingest_summaries", retries=10)\
+        .partial(table_name=table_names[0])\
+        .expand(dfs=[generate_summary])
 
     _check_index >> _create_index >> edgar_docs
 
