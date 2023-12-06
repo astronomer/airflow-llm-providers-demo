@@ -291,7 +291,9 @@ def FinSum_PgVector():
             chunksize=1000
         )
         
-    def chunk_summarization_openai(content: str):
+    def chunk_summarization_openai(content: str, fy: str, fp: str) -> str:
+        
+        logger.info(f"Summarizing chunk for {fy}:{fp}")
         
         response = openai_client.ChatCompletion().create(
             model="gpt-3.5-turbo-1106",
@@ -313,8 +315,10 @@ def FinSum_PgVector():
         else:
             return None
     
-    def doc_summarization_openai(content: str):
+    def doc_summarization_openai(content: str, doc_link: str) -> str:
         
+        logger.info(f"Summarizing document for {doc_link}")
+
         response = openai_client.ChatCompletion().create(
             model="gpt-4-1106-preview",
             messages=[
@@ -339,14 +343,19 @@ def FinSum_PgVector():
 
         df = pd.concat(dfs, ignore_index=True)
 
-        df["chunk_summary"] = df.content.apply(chunk_summarization_openai)
+        df["chunk_summary"] = df.apply(lambda x: chunk_summarization_openai(
+            content=x.content, fy=x.fiscal_year, fp=x.fiscal_period), axis=1)
 
         summaries_df = df.groupby("docLink").chunk_summary.apply("\n".join).reset_index()
-        summaries_df["summary"] = summaries_df.chunk_summary.apply(doc_summarization_openai)
+
+        summaries_df["summary"] = summaries_df.apply(lambda x: doc_summarization_openai(
+            content=x.chunk_summary, doc_link=x.docLink), axis=1)
+        
         summaries_df.drop("chunk_summary", axis=1, inplace=True)
 
-        summary_df = df.drop(["content", "chunk_summary", "id"], axis=1).drop_duplicates().merge(summaries_df)
-        summary_df.iloc[0]
+        summary_df = df.drop(["content", "chunk_summary"], axis=1).drop_duplicates().merge(summaries_df)
+
+        return summary_df
 
     _check_index = task.branch(check_tables)()
 

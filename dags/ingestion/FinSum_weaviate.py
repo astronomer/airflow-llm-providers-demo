@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowException
-from include.utils.weaviate.hooks.weaviate import _WeaviateHook
+from airflow.models.param import Param
 from airflow.providers.openai.hooks.openai import OpenAIHook
+from include.utils.weaviate.hooks.weaviate import _WeaviateHook
 
 from bs4 import BeautifulSoup
 import datetime
@@ -32,8 +33,6 @@ weaviate_client = weaviate_hook.get_client()
 
 class_names = ["TenQ", "TenQSummary"]
 
-tickers = ["f", "tsla"]
-
 schema_file = Path("include/data/weaviate_schema.json")
 
 default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
@@ -43,10 +42,18 @@ default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
     schedule_interval=None,
     start_date=datetime.datetime(2023, 9, 27),
     catchup=False,
-    is_paused_upon_creation=True,
+    is_paused_upon_creation=False,
     default_args=default_args,
+    params={
+        "ticker": Param(
+            "tsla",
+            title="Ticker symbol from a US-listed public company.",
+            type="string",
+            description="US-listed companies can be found at https://www.sec.gov/file/company-tickers"
+        )
+    }
 )
-def FinSum_Weaviate():
+def FinSum_Weaviate(ticker: str = None):
     """
     This DAG extracts and splits financial reporting data from the US 
     [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and ingests 
@@ -153,6 +160,8 @@ def FinSum_Weaviate():
         :return: A dataframe
         """
 
+        logger.info(f"Extracting documents for ticker {ticker}.")
+
         company_list = requests.get(
             url="https://www.sec.gov/files/company_tickers.json", 
             headers=edgar_headers)
@@ -196,10 +205,10 @@ def FinSum_Weaviate():
             link_10q = get_10q_link(accn=form.get("accn"), cik_number=cik_number)
             docs.append({
                 "docLink": link_10q, 
-                "ticker": ticker,
-                "cik_number": cik_number,
-                "fiscal_year": form.get("fy"), 
-                "fiscal_period": form.get("fp")
+                "tickerSymbol": ticker,
+                "cikNumber": cik_number,
+                "fiscalYear": form.get("fy"), 
+                "fiscalPeriod": form.get("fp")
                 })
             
         df = pd.DataFrame(docs)
@@ -211,20 +220,18 @@ def FinSum_Weaviate():
         
         return df
 
-    def split(dfs: list[pd.DataFrame]) -> pd.DataFrame:
+    def split(df: pd.DataFrame) -> pd.DataFrame:
         """
         This task concatenates multiple dataframes from upstream dynamic tasks and splits the content 
         first with an html splitter and then with a text splitter.
 
-        :param dfs: A list of dataframes from downstream dynamic tasks
+        :param df: A dataframe from an upstream extract task
         :return: A dataframe 
         """
 
         headers_to_split_on = [
             ("h2", "h2"),
         ]
-
-        df = pd.concat(dfs, axis=0, ignore_index=True)
 
         html_splitter = HTMLHeaderTextSplitter(headers_to_split_on)
         text_splitter = RecursiveCharacterTextSplitter(
@@ -247,10 +254,7 @@ def FinSum_Weaviate():
 
         return df
 
-    def weaviate_ingest(
-        dfs: list[pd.DataFrame],
-        class_name: str,
-    ):
+    def weaviate_ingest(df: pd.DataFrame, class_name: str):
         """
         This task concatenates multiple dataframes from upstream dynamic tasks and vectorizes with import to weaviate.
 
@@ -258,12 +262,10 @@ def FinSum_Weaviate():
         be represented as multiple chunks (each with a UUID which is unique in the DB) the doc_key is a way to represent
         all chunks associated with an ingested document.
 
-        :param dfs: A list of dataframes from downstream dynamic tasks
+        :param df: A dataframe from an upstream split task
         :param class_name: The name of the class to import data.  Class should be created with weaviate schema.
             type class_name: str
         """
-
-        df = pd.concat(dfs, ignore_index=True)
 
         df, uuid_column = weaviate_hook.generate_uuids(df=df, class_name=class_name)
 
@@ -277,9 +279,17 @@ def FinSum_Weaviate():
             verbose=True
         )
 
-        return df[["docLink", "content", uuid_column]]
+    def chunk_summarization_openai(content: str, ticker: str, fy: str, fp: str) -> str:
+        """
+        This function uses openai gpt-3.5-turbo-1106 to summarize a chunk of text.
 
-    def chunk_summarization_openai(content: str):
+        :param content: The text content to be summarized.
+        :param ticker: The company ticker symbol for (status printing).
+        :param fy: The fiscal year of the document chunk for (status printing).
+        :param fp: The fiscal period of the document chunk for (status printing).
+        :return: A summary string
+        """
+        logger.info(f"Summarizing chunk for ticker {ticker} {fy}:{fp}")
         
         response = openai_client.ChatCompletion().create(
             model="gpt-3.5-turbo-1106",
@@ -301,8 +311,18 @@ def FinSum_Weaviate():
         else:
             return None
     
-    def doc_summarization_openai(content: str):
-        
+    def doc_summarization_openai(content: str, doc_link: str) -> str:
+        """
+        This function uses openai gpt-4-1106-preview to summarize a concatenation of
+        document chunks.
+
+        :param content: The text content to be summarized.
+        :param doc_link: The URL of the document being summarized (status printing).
+        :return: A summary string
+        """
+
+        logger.info(f"Summarizing document for {doc_link}")
+
         response = openai_client.ChatCompletion().create(
             model="gpt-4-1106-preview",
             messages=[
@@ -323,37 +343,43 @@ def FinSum_Weaviate():
         else:
             return None
         
-    def summarize_openai(dfs: [pd.DataFrame]) -> pd.DataFrame:
+    def summarize_openai(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        This task uses openai to recursively summarize extracted documents. First the individual
+        chunks of the document are summarized.  Then the collection of chunk summaries are summarized.
 
-        df = pd.concat(dfs, ignore_index=True)
-
-        df["chunk_summary"] = df.content.apply(chunk_summarization_openai)
+        :param df: A Pandas dataframe from upstream split tasks
+        :return: A Pandas dataframe with summaries for ingest to a vector DB.
+        """
+        df["chunk_summary"] = df.apply(lambda x: chunk_summarization_openai(
+            content=x.content, fy=x.fiscalYear, fp=x.fiscalPeriod, ticker=x.tickerSymbol), 
+            axis=1)
 
         summaries_df = df.groupby("docLink").chunk_summary.apply("\n".join).reset_index()
-        summaries_df["summary"] = summaries_df.chunk_summary.apply(doc_summarization_openai)
+
+        summaries_df["summary"] = summaries_df.apply(lambda x: doc_summarization_openai(
+            content=x.chunk_summary, doc_link=x.docLink), axis=1)
+        
         summaries_df.drop("chunk_summary", axis=1, inplace=True)
 
-        summary_df = df.drop(["content", "chunk_summary", "id"], axis=1).drop_duplicates().merge(summaries_df)
-        summary_df.iloc[0]
+        summary_df = df.drop(["content", "chunk_summary"], axis=1).drop_duplicates().merge(summaries_df)
+
+        return summary_df
 
     _check_schema = task.branch(check_schemas)()
     
     _create_schema = task(create_schemas)()
 
-    edgar_docs = task(extract).expand(ticker=tickers)
+    edgar_docs = task(extract)(ticker=ticker)
 
-    split_docs = task(split).expand(dfs=[edgar_docs])
+    split_docs = task(split)(df=edgar_docs)
     
-    task(weaviate_ingest, task_id="import_chunks", retries=10)\
-        .partial(class_name=class_names[0])\
-        .expand(dfs=[split_docs])
+    task(weaviate_ingest, task_id="import_chunks")(class_name=class_names[0], df=split_docs)
 
-    generate_summary = task(summarize_openai).expand(dfs=[split_docs])
+    generate_summary = task(summarize_openai)(df=split_docs)
 
-    task(weaviate_ingest, task_id="import_summary", retries=10)\
-        .partial(class_name=class_names[1])\
-        .expand(dfs=[generate_summary])
+    task(weaviate_ingest, task_id="import_summary")(class_name=class_names[1], df=generate_summary)
 
     _check_schema >> _create_schema >> edgar_docs
 
-FinSum_Weaviate()
+FinSum_Weaviate(ticker = "tsla")

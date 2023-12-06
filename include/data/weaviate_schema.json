@@ -15,6 +15,14 @@
                 "modelVersion": "002",
                 "type": "text",
                 "vectorizeClassName": true
+                },
+            "qna-openai": {
+                "model": "text-davinci-003",
+                "maxTokens": 100,
+                "temperature": 0.0,
+                "topP": 1,
+                "frequencyPenalty": 0.0,
+                "presencePenalty": 0.0
                 }
         },
         "properties": [
@@ -76,16 +84,14 @@
             },
             {
                 "name": "fiscalYear",
-                "dataType": ["text"],
+                "dataType": ["int"],
                 "description": "Fiscal year of the filing.",
                 "indexFilterable": true,
-                "indexSearchable": true,
                 "moduleConfig": {
                     "text2vec-openai": {
                         "skip": true,
                         "vectorizePropertyName": false}
-                },
-                "tokenization": "word"
+                }
             },
             {
                 "name": "fiscalPeriod",
@@ -180,16 +186,14 @@
             },
             {
                 "name": "fiscalYear",
-                "dataType": ["text"],
+                "dataType": ["int"],
                 "description": "Fiscal year of the filing.",
                 "indexFilterable": true,
-                "indexSearchable": true,
                 "moduleConfig": {
                     "text2vec-openai": {
                         "skip": true,
                         "vectorizePropertyName": false}
-                },
-                "tokenization": "word"
+                }
             },
             {
                 "name": "fiscalPeriod",
