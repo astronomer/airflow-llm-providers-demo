@@ -28,13 +28,12 @@ import requests
 import unicodedata
 import uuid
 
+PINECONE_CONN_ID = "pinecone_default"
+OPENAI_CONN_ID = "openai_default"
+
 logger = logging.getLogger("airflow.task")
 
 edgar_headers={"User-Agent": "test1@test1.com"}
-
-pinecone_hook = PineconeHook("pinecone_default")
-openai_hook = OpenAIHook("openai_default")
-openai_client.api_key = openai_hook._get_api_key()
 
 index_names = ["tenq", "tenq-summary"]
 
@@ -68,6 +67,8 @@ def FinSum_Pinecone(ticker: str = None):
         """
         Check if indexes exists.
         """
+
+        pinecone_hook = PineconeHook(PINECONE_CONN_ID)
         
         if set(index_names).issubset(set(pinecone_hook.list_indexes())):
                 return ["extract"]
@@ -75,6 +76,8 @@ def FinSum_Pinecone(ticker: str = None):
             return ["create_indexes"]
 
     def create_indexes(existing: str = "ignore"):
+
+        pinecone_hook = PineconeHook(PINECONE_CONN_ID)
         
         for index_name in index_names:
 
@@ -276,6 +279,9 @@ def FinSum_Pinecone(ticker: str = None):
         :param index_name: The name of the index to import data. 
         """
 
+        openai_hook = OpenAIHook(OPENAI_CONN_ID)
+        pinecone_hook = PineconeHook(PINECONE_CONN_ID)
+
         df["metadata"] = df.drop([content_column_name], axis=1).to_dict('records')
 
         df["id"] = df[content_column_name].apply(lambda x: str(uuid.uuid5(name=x+index_name, 
@@ -304,6 +310,9 @@ def FinSum_Pinecone(ticker: str = None):
         :param fp: The fiscal period of the document chunk for (status printing).
         :return: A summary string
         """
+        
+        openai_client.api_key = OpenAIHook(OPENAI_CONN_ID)._get_api_key()
+
         logger.info(f"Summarizing chunk for ticker {ticker} {fy}:{fp}")
         
         response = openai_client.ChatCompletion().create(
@@ -335,6 +344,8 @@ def FinSum_Pinecone(ticker: str = None):
         :param doc_link: The URL of the document being summarized (status printing).
         :return: A summary string
         """
+
+        openai_client.api_key = OpenAIHook(OPENAI_CONN_ID)._get_api_key()
 
         logger.info(f"Summarizing document for {doc_link}")
 

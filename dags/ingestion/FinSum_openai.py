@@ -28,12 +28,11 @@ import requests
 import unicodedata
 import uuid
 
+OPENAI_CONN_ID = "openai_default"
+
 logger = logging.getLogger("airflow.task")
 
 edgar_headers={"User-Agent": "test1@test1.com"}
-
-openai_hook = OpenAIHook("openai_default")
-openai_client.api_key = openai_hook._get_api_key()
 
 default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
 
@@ -247,6 +246,8 @@ def FinSum_OpenAI(ticker: str = None):
         :param output_file_name: Path for saving embeddings as a parquet file
         :return: Location of saved file
         """
+        
+        openai_hook = OpenAIHook(OPENAI_CONN_ID)
 
         df["id"] = df[content_column_name].apply(
             lambda x: str(uuid.uuid5(
@@ -273,6 +274,9 @@ def FinSum_OpenAI(ticker: str = None):
         :param fp: The fiscal period of the document chunk for (status printing).
         :return: A summary string
         """
+        
+        openai_client.api_key = OpenAIHook(OPENAI_CONN_ID)._get_api_key()
+
         logger.info(f"Summarizing chunk for ticker {ticker} {fy}:{fp}")
         
         response = openai_client.ChatCompletion().create(
@@ -304,6 +308,8 @@ def FinSum_OpenAI(ticker: str = None):
         :param doc_link: The URL of the document being summarized (status printing).
         :return: A summary string
         """
+        
+        openai_client.api_key = OpenAIHook(OPENAI_CONN_ID)._get_api_key()
 
         logger.info(f"Summarizing document for {doc_link}")
 

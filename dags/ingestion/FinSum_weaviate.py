@@ -34,12 +34,6 @@ logger = logging.getLogger("airflow.task")
 
 edgar_headers={"User-Agent": "test1@test1.com"}
 
-openai_hook = OpenAIHook("openai_default")
-openai_client.api_key = openai_hook._get_api_key()
-
-weaviate_hook = _WeaviateHook("weaviate_default")
-weaviate_client = weaviate_hook.get_client()
-
 class_names = ["TenQ", "TenQSummary"]
 
 default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
@@ -77,6 +71,8 @@ def FinSum_Weaviate(ticker: str = None):
         so check_schema_subset is used recursively to check that all objects in the requested schema are
         represented in the current schema.
         """
+        
+        weaviate_hook = _WeaviateHook("weaviate_default")
 
         class_objects = get_schema()
 
@@ -90,6 +86,9 @@ def FinSum_Weaviate(ticker: str = None):
         """
         Creates the weaviate class schemas.
         """
+        
+        weaviate_hook = _WeaviateHook("weaviate_default")
+
         class_objects = get_schema()
         weaviate_hook.create_schema(class_objects=class_objects, existing="ignore")
 
@@ -277,6 +276,8 @@ def FinSum_Weaviate(ticker: str = None):
             type class_name: str
         """
 
+        weaviate_hook = _WeaviateHook("weaviate_default")
+
         df, uuid_column = weaviate_hook.generate_uuids(df=df, class_name=class_name)
 
         weaviate_hook.ingest_data(
@@ -299,6 +300,9 @@ def FinSum_Weaviate(ticker: str = None):
         :param fp: The fiscal period of the document chunk for (status printing).
         :return: A summary string
         """
+        
+        openai_client.api_key = OpenAIHook("openai_default")._get_api_key()
+
         logger.info(f"Summarizing chunk for ticker {ticker} {fy}:{fp}")
         
         response = openai_client.ChatCompletion().create(
@@ -330,6 +334,8 @@ def FinSum_Weaviate(ticker: str = None):
         :param doc_link: The URL of the document being summarized (status printing).
         :return: A summary string
         """
+
+        openai_client.api_key = OpenAIHook("openai_default")._get_api_key()
 
         logger.info(f"Summarizing document for {doc_link}")
 
