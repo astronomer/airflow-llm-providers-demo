@@ -8,7 +8,6 @@ from include.utils.weaviate.hooks.weaviate import _WeaviateHook
 
 from bs4 import BeautifulSoup
 import datetime
-import json
 from langchain.schema import Document
 from langchain.text_splitter import (
     HTMLHeaderTextSplitter,
@@ -17,7 +16,6 @@ from langchain.text_splitter import (
 import logging
 import openai as openai_client
 import pandas as pd
-from pathlib import Path
 import requests
 import unicodedata
 
@@ -32,8 +30,6 @@ weaviate_hook = _WeaviateHook("weaviate_default")
 weaviate_client = weaviate_hook.get_client()
 
 class_names = ["TenQ", "TenQSummary"]
-
-schema_file = Path("include/data/weaviate_schema.json")
 
 default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
 
@@ -59,6 +55,9 @@ def FinSum_Weaviate(ticker: str = None):
     [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and ingests 
     the data to a Weaviate vector database for generative question answering.  The DAG also 
     creates and vectorizes summarizations of the 10-Q document.
+
+    This DAG is accompanied by a Streamlit UI.  To run the UI follow the instructions in:
+    https://github.com/astronomer/airflow-llm-providers-demo/blob/main/README.md
     """
 
     def check_schemas() -> str:
@@ -68,7 +67,7 @@ def FinSum_Weaviate(ticker: str = None):
         represented in the current schema.
         """
 
-        class_objects = json.loads(schema_file.read_text())
+        class_objects = get_schema()
 
         return (
             ["extract"]
@@ -80,7 +79,7 @@ def FinSum_Weaviate(ticker: str = None):
         """
         Creates the weaviate class schemas.
         """
-        class_objects = json.loads(schema_file.read_text())
+        class_objects = get_schema()
         weaviate_hook.create_schema(class_objects=class_objects, existing="ignore")
 
     def remove_tables(content:str):
@@ -383,3 +382,83 @@ def FinSum_Weaviate(ticker: str = None):
     _check_schema >> _create_schema >> edgar_docs
 
 FinSum_Weaviate(ticker = "tsla")
+
+def get_schema() -> [dict]:
+    return [
+        {
+            "class": "TenQ",
+            "description": "SEC filing data form 10-Q",
+            "vectorizer": "text2vec-openai",
+            "properties": [
+                {
+                    "name": "content",
+                    "dataType": ["text"],
+                    "description": "10-Q content extracted as text and split"
+                },
+                {
+                    "name": "docLink",
+                    "dataType": ["text"],
+                    "description": "Link to the 10-Q filing.",
+                    "tokenization": "field"
+                },
+                {
+                    "name": "tickerSymbol",
+                    "dataType": ["text"],
+                    "description": "SEC ticker symbol for a registered company."
+                },
+                {
+                    "name": "cikNumber",
+                    "dataType": ["text"],
+                    "description": "The SEC Central Index Key number."
+                },
+                {
+                    "name": "fiscalYear",
+                    "dataType": ["int"],
+                    "description": "Fiscal year of the filing."
+                },
+                {
+                    "name": "fiscalPeriod",
+                    "dataType": ["text"],
+                    "description": "Fiscal period (ie quarter name) of the filing."
+                }
+            ]
+        },
+        {
+            "class": "TenQSummary",
+            "description": "Summarization of SEC filing data form 10-Q",
+            "vectorizer": "text2vec-openai",
+            "properties": [
+                {
+                    "name": "summary",
+                    "dataType": ["text"],
+                    "description": "Summary of 10-Q recursively generated from chunks"
+                },
+                {
+                    "name": "docLink",
+                    "dataType": ["text"],
+                    "description": "Link to the 10-Q filing.",
+                    "tokenization": "field"
+                },
+                {
+                    "name": "tickerSymbol",
+                    "dataType": ["text"],
+                    "description": "SEC ticker symbol for a registered company."
+                },
+                {
+                    "name": "cikNumber",
+                    "dataType": ["text"],
+                    "description": "The SEC Central Index Key number."
+                },
+                {
+                    "name": "fiscalYear",
+                    "dataType": ["int"],
+                    "description": "Fiscal year of the filing."
+                },
+                {
+                    "name": "fiscalPeriod",
+                    "dataType": ["text"],
+                    "description": "Fiscal period (ie quarter name) of the filing."
+                }
+            ]
+        }
+    ]

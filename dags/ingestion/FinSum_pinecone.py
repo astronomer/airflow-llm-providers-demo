@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowException
+from airflow.models.param import Param
 from airflow.providers.pinecone.hooks.pinecone import PineconeHook
 from airflow.providers.openai.hooks.openai import OpenAIHook
 
@@ -29,8 +30,6 @@ openai_client.api_key = openai_hook._get_api_key()
 
 index_names = ["tenq", "tenq-summary"]
 
-tickers = ["f", "tsla"]
-
 default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
 
 
@@ -38,10 +37,18 @@ default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
     schedule_interval=None,
     start_date=datetime.datetime(2023, 9, 27),
     catchup=False,
-    is_paused_upon_creation=True,
+    is_paused_upon_creation=False,
     default_args=default_args,
+    params={
+        "ticker": Param(
+            "",
+            title="Ticker symbol from a US-listed public company.",
+            type="string",
+            description="US-listed companies can be found at https://www.sec.gov/file/company-tickers"
+        )
+    }
 )
-def FinSum_Pinecone():
+def FinSum_Pinecone(ticker: str = None):
     """
     This DAG extracts and splits financial reporting data from the US 
     [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and ingests 
@@ -157,6 +164,8 @@ def FinSum_Pinecone():
         :return: A dataframe
         """
 
+        logger.info(f"Extracting documents for ticker {ticker}.")
+
         company_list = requests.get(
             url="https://www.sec.gov/files/company_tickers.json", 
             headers=edgar_headers)
@@ -200,10 +209,10 @@ def FinSum_Pinecone():
             link_10q = get_10q_link(accn=form.get("accn"), cik_number=cik_number)
             docs.append({
                 "docLink": link_10q, 
-                "ticker": ticker,
-                "cik_number": cik_number,
-                "fiscal_year": form.get("fy"), 
-                "fiscal_period": form.get("fp")
+                "tickerSymbol": ticker,
+                "cikNumber": cik_number,
+                "fiscalYear": form.get("fy"), 
+                "fiscalPeriod": form.get("fp")
                 })
             
         df = pd.DataFrame(docs)
@@ -215,20 +224,18 @@ def FinSum_Pinecone():
         
         return df
 
-    def split(dfs: list[pd.DataFrame]) -> pd.DataFrame:
+    def split(df: pd.DataFrame) -> pd.DataFrame:
         """
         This task concatenates multiple dataframes from upstream dynamic tasks and splits the content 
         first with an html splitter and then with a text splitter.
 
-        :param dfs: A list of dataframes from downstream dynamic tasks
+        :param df: A dataframe from an upstream extract task
         :return: A dataframe 
         """
 
         headers_to_split_on = [
             ("h2", "h2"),
         ]
-
-        df = pd.concat(dfs, axis=0, ignore_index=True)
 
         html_splitter = HTMLHeaderTextSplitter(headers_to_split_on)
         text_splitter = RecursiveCharacterTextSplitter(
@@ -251,19 +258,14 @@ def FinSum_Pinecone():
 
         return df
 
-    def pinecone_ingest(
-        dfs: list[pd.DataFrame],
-        index_name: str,
-    ):
+    def pinecone_ingest(df: pd.DataFrame, index_name: str):
         """
         This task concatenates multiple dataframes from upstream dynamic tasks and vectorizes 
         with import to pinecone.
 
-        :param dfs: A list of dataframes from downstream dynamic tasks
+        :param df: A dataframe from an upstream split task
         :param index_name: The name of the index to import data. 
         """
-
-        df = pd.concat(dfs, ignore_index=True)
 
         df["metadata"] = df.drop(["content"], axis=1).to_dict('records')
 
@@ -283,9 +285,17 @@ def FinSum_Pinecone():
             pool_threads=30,
             )
         
-    def chunk_summarization_openai(content: str, fy: str, fp: str) -> str:
-        
-        logger.info(f"Summarizing chunk for {fy}:{fp}")
+    def chunk_summarization_openai(content: str, ticker: str, fy: str, fp: str) -> str:
+        """
+        This function uses openai gpt-3.5-turbo-1106 to summarize a chunk of text.
+
+        :param content: The text content to be summarized.
+        :param ticker: The company ticker symbol for (status printing).
+        :param fy: The fiscal year of the document chunk for (status printing).
+        :param fp: The fiscal period of the document chunk for (status printing).
+        :return: A summary string
+        """
+        logger.info(f"Summarizing chunk for ticker {ticker} {fy}:{fp}")
         
         response = openai_client.ChatCompletion().create(
             model="gpt-3.5-turbo-1106",
@@ -308,7 +318,15 @@ def FinSum_Pinecone():
             return None
     
     def doc_summarization_openai(content: str, doc_link: str) -> str:
-        
+        """
+        This function uses openai gpt-4-1106-preview to summarize a concatenation of
+        document chunks.
+
+        :param content: The text content to be summarized.
+        :param doc_link: The URL of the document being summarized (status printing).
+        :return: A summary string
+        """
+
         logger.info(f"Summarizing document for {doc_link}")
 
         response = openai_client.ChatCompletion().create(
@@ -331,12 +349,17 @@ def FinSum_Pinecone():
         else:
             return None
         
-    def summarize_openai(dfs: [pd.DataFrame]) -> pd.DataFrame:
+    def summarize_openai(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        This task uses openai to recursively summarize extracted documents. First the individual
+        chunks of the document are summarized.  Then the collection of chunk summaries are summarized.
 
-        df = pd.concat(dfs, ignore_index=True)
-
+        :param df: A Pandas dataframe from upstream split tasks
+        :return: A Pandas dataframe with summaries for ingest to a vector DB.
+        """
         df["chunk_summary"] = df.apply(lambda x: chunk_summarization_openai(
-            content=x.content, fy=x.fiscal_year, fp=x.fiscal_period), axis=1)
+            content=x.content, fy=x.fiscalYear, fp=x.fiscalPeriod, ticker=x.tickerSymbol), 
+            axis=1)
 
         summaries_df = df.groupby("docLink").chunk_summary.apply("\n".join).reset_index()
 
@@ -353,20 +376,16 @@ def FinSum_Pinecone():
 
     _create_index = task(create_indexes)()
 
-    edgar_docs = task(extract).expand(ticker=tickers)
+    edgar_docs = task(extract)(ticker=ticker)
 
-    split_docs = task(split).expand(dfs=[edgar_docs])
+    split_docs = task(split)(df=edgar_docs)
     
-    task(pinecone_ingest, task_id="import_chunks", retries=10)\
-        .partial(index_name=index_names[0])\
-        .expand(dfs=[split_docs])
+    task(pinecone_ingest, task_id="import_chunks")(index_name=index_names[0], df=split_docs)
 
-    generate_summary = task(summarize_openai).expand(dfs=[split_docs])
+    generate_summary = task(summarize_openai)(df=split_docs)
 
-    task(pinecone_ingest, task_id="import_summary", retries=10)\
-        .partial(index_name=index_names[1])\
-        .expand(dfs=[generate_summary])
-
+    task(pinecone_ingest, task_id="import_summary")(index_name=index_names[1], df=generate_summary)
+    
     _check_index >> _create_index >> edgar_docs
 
 FinSum_Pinecone()
