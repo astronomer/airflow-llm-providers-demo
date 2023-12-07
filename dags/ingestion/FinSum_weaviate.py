@@ -1,3 +1,14 @@
+"""
+## Summarize and search financial documents using OpenAI's LLMs and Weaviate vector database
+
+This DAG extracts and splits financial reporting data from the US 
+[Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and ingests 
+the data to a Weaviate vector database for generative question answering.  The DAG also 
+creates and vectorizes summarizations of the 10-Q document.
+
+This DAG is accompanied by a Streamlit UI.  To run the UI follow the instructions in:
+https://github.com/astronomer/airflow-llm-providers-demo/blob/main/README.md
+"""
 from __future__ import annotations
 
 from airflow.decorators import dag, task
@@ -42,7 +53,7 @@ default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
     default_args=default_args,
     params={
         "ticker": Param(
-            "tsla",
+            default="",
             title="Ticker symbol from a US-listed public company.",
             type="string",
             description="US-listed companies can be found at https://www.sec.gov/file/company-tickers"
@@ -82,7 +93,7 @@ def FinSum_Weaviate(ticker: str = None):
         class_objects = get_schema()
         weaviate_hook.create_schema(class_objects=class_objects, existing="ignore")
 
-    def remove_tables(content:str):
+    def remove_html_tables(content:str):
         """
         Remove all "table" tags from html content leaving only text.
 
@@ -111,7 +122,7 @@ def FinSum_Weaviate(ticker: str = None):
         if content.ok:
             content_type = content.headers['Content-Type']
             if content_type == 'text/html':
-                content = remove_tables(content.text)
+                content = remove_html_tables(content.text)
             else:
                 logger.warning(f"Unsupported content type ({content_type}) for doc {doc_link}.  Skipping.")
                 content = None
@@ -381,7 +392,7 @@ def FinSum_Weaviate(ticker: str = None):
 
     _check_schema >> _create_schema >> edgar_docs
 
-FinSum_Weaviate(ticker = "tsla")
+FinSum_Weaviate(ticker="")
 
 def get_schema() -> [dict]:
     return [

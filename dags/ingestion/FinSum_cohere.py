@@ -1,7 +1,16 @@
+"""
+## Summarize and search financial documents using Cohere's LLMs.
+
+This DAG extracts and splits financial reporting data from the US 
+[Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and generates 
+vector embeddings with cohere embeddings for generative question answering.  The DAG also 
+creates and vectorizes summarizations of the 10-Q document using Cohere Summarize.
+"""
 from __future__ import annotations
 
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowException
+from airflow.models.param import Param
 from airflow.providers.cohere.hooks.cohere import CohereHook
 
 from bs4 import BeautifulSoup
@@ -23,8 +32,7 @@ logger = logging.getLogger("airflow.task")
 edgar_headers={"User-Agent": "test1@test1.com"}
 
 cohere_hook = CohereHook("cohere_default")
-
-tickers = ["f", "tsla"]
+cohere_client = cohere_hook.get_conn
 
 default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
 
@@ -35,8 +43,16 @@ default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
     catchup=False,
     is_paused_upon_creation=True,
     default_args=default_args,
+    params={
+        "ticker": Param(
+            "",
+            title="Ticker symbol from a US-listed public company.",
+            type="string",
+            description="US-listed companies can be found at https://www.sec.gov/file/company-tickers"
+        )
+    }
 )
-def FinSum_Cohere():
+def FinSum_Cohere(ticker: str = None):
     """
     This DAG extracts and splits financial reporting data from the US 
     [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and generates 
@@ -49,7 +65,7 @@ def FinSum_Cohere():
 
     """
 
-    def remove_tables(content:str):
+    def remove_html_tables(content:str):
         """
         Remove all "table" tags from html content leaving only text.
 
@@ -78,7 +94,7 @@ def FinSum_Cohere():
         if content.ok:
             content_type = content.headers['Content-Type']
             if content_type == 'text/html':
-                content = remove_tables(content.text)
+                content = remove_html_tables(content.text)
             else:
                 logger.warning(f"Unsupported content type ({content_type}) for doc {doc_link}.  Skipping.")
                 content = None
@@ -126,6 +142,8 @@ def FinSum_Cohere():
         :return: A dataframe
         """
 
+        logger.info(f"Extracting documents for ticker {ticker}.")
+
         company_list = requests.get(
             url="https://www.sec.gov/files/company_tickers.json", 
             headers=edgar_headers)
@@ -169,10 +187,10 @@ def FinSum_Cohere():
             link_10q = get_10q_link(accn=form.get("accn"), cik_number=cik_number)
             docs.append({
                 "docLink": link_10q, 
-                "ticker": ticker,
-                "cik_number": cik_number,
-                "fiscal_year": form.get("fy"), 
-                "fiscal_period": form.get("fp")
+                "tickerSymbol": ticker,
+                "cikNumber": cik_number,
+                "fiscalYear": form.get("fy"), 
+                "fiscalPeriod": form.get("fp")
                 })
             
         df = pd.DataFrame(docs)
@@ -184,12 +202,12 @@ def FinSum_Cohere():
         
         return df
 
-    def split(dfs: list[pd.DataFrame]) -> pd.DataFrame:
+    def split(df: pd.DataFrame) -> pd.DataFrame:
         """
         This task concatenates multiple dataframes from upstream dynamic tasks and splits the content 
         first with an html splitter and then with a text splitter.
 
-        :param dfs: A list of dataframes from downstream dynamic tasks
+        :param df: A dataframe from an upstream extract task
         :return: A dataframe 
         """
 
@@ -197,11 +215,9 @@ def FinSum_Cohere():
             ("h2", "h2"),
         ]
 
-        df = pd.concat(dfs, axis=0, ignore_index=True)
-
         html_splitter = HTMLHeaderTextSplitter(headers_to_split_on)
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=4000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
+            chunk_size=10000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]
             )
 
         df["doc_chunks"] = df["content"].apply(lambda x: html_splitter.split_text(text=x))
@@ -220,21 +236,24 @@ def FinSum_Cohere():
 
         return df
 
-    def vectorize(dfs: list[pd.DataFrame], output_file_name: Path) -> str:
+    def vectorize(df: pd.DataFrame, content_column_name: str, output_file_name: Path) -> str:
         """
         This task concatenates multiple dataframes from upstream dynamic tasks and vectorizes 
         with Cohere Embeddings.  The vectorized dataset is written to disk.
 
-        :param dfs: A list of dataframes from downstream dynamic tasks
+        :param df: A dataframe from an upstream split task
+        :param content_column_name: The name of the column with text to embed and ingest
         :param output_file_name: Path for saving embeddings
         :return: Location of saved file
         """
 
-        df = pd.concat(dfs, ignore_index=True)
+        df["id"] = df[content_column_name].apply(
+            lambda x: str(uuid.uuid5(
+                name=x, 
+                namespace=uuid.NAMESPACE_DNS))
+            )
 
-        df["id"] = df.content.apply(lambda x: str(uuid.uuid5(name=x, namespace=uuid.NAMESPACE_DNS)))
-
-        df["vector"] = df.content.apply(
+        df["vector"] = df[content_column_name].apply(
             lambda x: cohere_hook.create_embeddings(
                 texts=[x], model="embed-multilingual-v2.0"
                 )[0]
@@ -244,14 +263,87 @@ def FinSum_Cohere():
 
         return output_file_name
 
-    edgar_docs = task(extract).expand(ticker=tickers)
+    def chunk_summarization_cohere(content: str, ticker: str, fy: str, fp: str) -> str:
+        """
+        This function uses Cohere's "Summarize" endpoint to summarize a chunk of text.
 
-    split_docs = task(split).expand(dfs=[edgar_docs])
+        :param content: The text content to be summarized.
+        :param ticker: The company ticker symbol for (status printing).
+        :param fy: The fiscal year of the document chunk for (status printing).
+        :param fp: The fiscal period of the document chunk for (status printing).
+        :return: A summary string
+        """
+        logger.info(f"Summarizing chunk for ticker {ticker} {fy}:{fp}")
+        
+        return cohere_client.summarize(
+            text=content,
+            model="command",
+            length="long",
+            extractiveness="medium",
+            temperature=1,
+            format="paragraph"
+        ).summary
+   
+    def doc_summarization_cohere(content: str, doc_link: str) -> str:
+        """
+        This function uses Cohere's "Summarize" endpoint to summarize a concatenation 
+        of chunk summaries.
 
-    embeddings_file = (
-        task(vectorize)
-        .partial(output_file_name='include/data/html/cohere_embeddings.parquet')
-        .expand(dfs=[split_docs])
+        :param content: The text content to be summarized.
+        :param doc_link: The URL of the document being summarized (status printing).
+        :return: A summary string
+        """
+
+        logger.info(f"Summarizing document for {doc_link}")
+
+        return cohere_client.summarize(
+            text=content,
+            model="command",
+            length="long",
+            extractiveness="medium",
+            temperature=1,
+            format="paragraph"
+        ).summary
+        
+    def summarize_cohere(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        This task uses cohere to recursively summarize extracted documents. First the individual
+        chunks of the document are summarized.  Then the collection of chunk summaries are summarized.
+
+        :param df: A Pandas dataframe from upstream split tasks
+        :return: A Pandas dataframe with summaries for ingest to a vector DB.
+        """
+        df["chunk_summary"] = df.apply(lambda x: chunk_summarization_cohere(
+            content=x.content, fy=x.fiscalYear, fp=x.fiscalPeriod, ticker=x.tickerSymbol), 
+            axis=1)
+
+        summaries_df = df.groupby("docLink").chunk_summary.apply("\n".join).reset_index()
+
+        summaries_df["summary"] = summaries_df.apply(lambda x: doc_summarization_cohere(
+            content=x.chunk_summary, doc_link=x.docLink), axis=1)
+        
+        summaries_df.drop("chunk_summary", axis=1, inplace=True)
+
+        summary_df = df.drop(["content", "chunk_summary"], axis=1).drop_duplicates().merge(summaries_df)
+
+        return summary_df
+
+    edgar_docs = task(extract)(ticker=ticker)
+
+    split_docs = task(split)(df=edgar_docs)
+
+    embeddings_file = task(vectorize)(
+        output_file_name="include/data/html/cohere_embeddings.parquet",
+        content_column_name="content",
+        df=split_docs)
+    
+    generate_summary = task(summarize_cohere)(df=split_docs)
+
+    summaries_file = (
+        task(vectorize, task_id="vectorize_summaries")(
+            output_file_name="include/data/html/cohere_summary_embeddings.parquet",
+            content_column_name="summary",
+            df=generate_summary)
     )
 
-FinSum_Cohere()
+FinSum_Cohere(ticker="")

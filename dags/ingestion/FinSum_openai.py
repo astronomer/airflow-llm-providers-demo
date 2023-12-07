@@ -1,7 +1,16 @@
+"""
+## Summarize and search financial documents using OpenAI's LLMs.
+
+This DAG extracts and splits financial reporting data from the US 
+[Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and generates 
+vector embeddings with OpenAI embeddings model for generative question answering.  The DAG also 
+creates and vectorizes summarizations of the 10-Q document using OpenAI completions.
+"""
 from __future__ import annotations
 
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowException
+from airflow.models.param import Param
 from airflow.providers.openai.hooks.openai import OpenAIHook
 
 from bs4 import BeautifulSoup
@@ -26,8 +35,6 @@ edgar_headers={"User-Agent": "test1@test1.com"}
 openai_hook = OpenAIHook("openai_default")
 openai_client.api_key = openai_hook._get_api_key()
 
-tickers = ["f", "tsla"]
-
 default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
 
 
@@ -37,8 +44,16 @@ default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
     catchup=False,
     is_paused_upon_creation=True,
     default_args=default_args,
+    params={
+        "ticker": Param(
+            "",
+            title="Ticker symbol from a US-listed public company.",
+            type="string",
+            description="US-listed companies can be found at https://www.sec.gov/file/company-tickers"
+        )
+    }
 )
-def FinSum_OpenAI():
+def FinSum_OpenAI(ticker: str = None):
     """
     This DAG extracts and splits financial reporting data from the US 
     [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and generates 
@@ -51,7 +66,7 @@ def FinSum_OpenAI():
 
     """
 
-    def remove_tables(content:str):
+    def remove_html_tables(content:str):
         """
         Remove all "table" tags from html content leaving only text.
 
@@ -80,7 +95,7 @@ def FinSum_OpenAI():
         if content.ok:
             content_type = content.headers['Content-Type']
             if content_type == 'text/html':
-                content = remove_tables(content.text)
+                content = remove_html_tables(content.text)
             else:
                 logger.warning(f"Unsupported content type ({content_type}) for doc {doc_link}.  Skipping.")
                 content = None
@@ -128,6 +143,8 @@ def FinSum_OpenAI():
         :return: A dataframe
         """
 
+        logger.info(f"Extracting documents for ticker {ticker}.")
+
         company_list = requests.get(
             url="https://www.sec.gov/files/company_tickers.json", 
             headers=edgar_headers)
@@ -171,10 +188,10 @@ def FinSum_OpenAI():
             link_10q = get_10q_link(accn=form.get("accn"), cik_number=cik_number)
             docs.append({
                 "docLink": link_10q, 
-                "ticker": ticker,
-                "cik_number": cik_number,
-                "fiscal_year": form.get("fy"), 
-                "fiscal_period": form.get("fp")
+                "tickerSymbol": ticker,
+                "cikNumber": cik_number,
+                "fiscalYear": form.get("fy"), 
+                "fiscalPeriod": form.get("fp")
                 })
             
         df = pd.DataFrame(docs)
@@ -186,20 +203,18 @@ def FinSum_OpenAI():
         
         return df
 
-    def split(dfs: list[pd.DataFrame]) -> pd.DataFrame:
+    def split(df: pd.DataFrame) -> pd.DataFrame:
         """
         This task concatenates multiple dataframes from upstream dynamic tasks and splits the content 
         first with an html splitter and then with a text splitter.
 
-        :param dfs: A list of dataframes from downstream dynamic tasks
+        :param df: A dataframe from an upstream extract task
         :return: A dataframe 
         """
 
         headers_to_split_on = [
             ("h2", "h2"),
         ]
-
-        df = pd.concat(dfs, axis=0, ignore_index=True)
 
         html_splitter = HTMLHeaderTextSplitter(headers_to_split_on)
         text_splitter = RecursiveCharacterTextSplitter(
@@ -222,30 +237,43 @@ def FinSum_OpenAI():
 
         return df
 
-    def vectorize( dfs: list[pd.DataFrame], output_file_name: Path) -> str:
+    def vectorize(df: pd.DataFrame, content_column_name: str, output_file_name: Path) -> str:
         """
-        This task concatenates multiple dataframes from upstream dynamic tasks and vectorizes with OpenAI Embeddings.
+        This task concatenates multiple dataframes from upstream dynamic tasks and 
+        vectorizes with OpenAI Embeddings.
 
-        :param dfs: A list of dataframes from downstream dynamic tasks
-        :param output_file_name: Path for saving embeddings
+        :param df: A Pandas dataframes from upstream split tasks
+        :param content_column_name: The name of the column with text to embed and ingest
+        :param output_file_name: Path for saving embeddings as a parquet file
         :return: Location of saved file
         """
 
-        df = pd.concat(dfs, ignore_index=True)
+        df["id"] = df[content_column_name].apply(
+            lambda x: str(uuid.uuid5(
+                name=x, 
+                namespace=uuid.NAMESPACE_DNS)))
 
-        df["id"] = df.content.apply(lambda x: str(uuid.uuid5(name=x, namespace=uuid.NAMESPACE_DNS)))
-
-        df["vector"] = df.content.apply(
-            lambda x: openai_hook.create_embeddings(text=x, model="text-embedding-ada-002")
+        df["vector"] = df[content_column_name].apply(
+            lambda x: openai_hook.create_embeddings(
+                text=x, 
+                model="text-embedding-ada-002")
             )
         
         df.to_parquet(output_file_name)
 
         return output_file_name
 
-    def chunk_summarization_openai(content: str, fy: str, fp: str) -> str:
-        
-        logger.info(f"Summarizing chunk for {fy}:{fp}")
+    def chunk_summarization_openai(content: str, ticker: str, fy: str, fp: str) -> str:
+        """
+        This function uses openai gpt-3.5-turbo-1106 to summarize a chunk of text.
+
+        :param content: The text content to be summarized.
+        :param ticker: The company ticker symbol for (status printing).
+        :param fy: The fiscal year of the document chunk for (status printing).
+        :param fp: The fiscal period of the document chunk for (status printing).
+        :return: A summary string
+        """
+        logger.info(f"Summarizing chunk for ticker {ticker} {fy}:{fp}")
         
         response = openai_client.ChatCompletion().create(
             model="gpt-3.5-turbo-1106",
@@ -268,7 +296,15 @@ def FinSum_OpenAI():
             return None
     
     def doc_summarization_openai(content: str, doc_link: str) -> str:
-        
+        """
+        This function uses openai gpt-4-1106-preview to summarize a concatenation of
+        document chunks.
+
+        :param content: The text content to be summarized.
+        :param doc_link: The URL of the document being summarized (status printing).
+        :return: A summary string
+        """
+
         logger.info(f"Summarizing document for {doc_link}")
 
         response = openai_client.ChatCompletion().create(
@@ -291,12 +327,17 @@ def FinSum_OpenAI():
         else:
             return None
         
-    def summarize_openai(dfs: [pd.DataFrame]) -> pd.DataFrame:
+    def summarize_openai(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        This task uses openai to recursively summarize extracted documents. First the individual
+        chunks of the document are summarized.  Then the collection of chunk summaries are summarized.
 
-        df = pd.concat(dfs, ignore_index=True)
-
+        :param df: A Pandas dataframe from upstream split tasks
+        :return: A Pandas dataframe with summaries for ingest to a vector DB.
+        """
         df["chunk_summary"] = df.apply(lambda x: chunk_summarization_openai(
-            content=x.content, fy=x.fiscal_year, fp=x.fiscal_period), axis=1)
+            content=x.content, fy=x.fiscalYear, fp=x.fiscalPeriod, ticker=x.tickerSymbol), 
+            axis=1)
 
         summaries_df = df.groupby("docLink").chunk_summary.apply("\n".join).reset_index()
 
@@ -309,22 +350,24 @@ def FinSum_OpenAI():
 
         return summary_df
 
-    edgar_docs = task(extract).expand(ticker=tickers)
+    edgar_docs = task(extract)(ticker=ticker)
 
-    split_docs = task(split).expand(dfs=[edgar_docs])
-
-    embeddings_file = (
-        task(vectorize, task_id="vectorize_chunks")
-        .partial(output_file_name='include/data/html/openai_embeddings.parquet')
-        .expand(dfs=[split_docs])
-    )
-
-    generate_summary = task(summarize_openai).expand(dfs=[split_docs])
+    split_docs = task(split)(df=edgar_docs)
 
     embeddings_file = (
-        task(vectorize, task_id="vectorize_summaries")
-        .partial(output_file_name='include/data/html/openai_summary_embeddings.parquet')
-        .expand(dfs=[generate_summary])
+        task(vectorize, task_id="vectorize_chunks")(
+            output_file_name='include/data/html/openai_embeddings.parquet',
+            content_column_name="content",
+            df=split_docs)
     )
 
-FinSum_OpenAI()
+    generate_summary = task(summarize_openai)(df=split_docs)
+
+    summaries_file = (
+        task(vectorize, task_id="vectorize_summaries")(
+            output_file_name='include/data/html/openai_summary_embeddings.parquet',
+            content_column_name="summary",
+            df=generate_summary)
+    )
+
+FinSum_OpenAI(ticker="")

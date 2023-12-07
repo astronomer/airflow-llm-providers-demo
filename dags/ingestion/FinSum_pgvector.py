@@ -1,9 +1,18 @@
+"""
+## Summarize and search financial documents using Cohere's LLMs and the pgvector extensions of postgres.
+
+This DAG extracts and splits financial reporting data from the US 
+[Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and ingests 
+the data to a PgVector vector database for generative question answering.  The DAG also 
+creates and vectorizes summarizations of the 10-Q document.
+"""
 from __future__ import annotations
 
 from airflow.decorators import dag, task
 from airflow.exceptions import AirflowException
+from airflow.models.param import Param
+from airflow.providers.cohere.hooks.cohere import CohereHook
 from airflow.providers.pgvector.hooks.pgvector import PgVectorHook
-from airflow.providers.openai.hooks.openai import OpenAIHook
 
 from bs4 import BeautifulSoup
 import datetime
@@ -13,7 +22,6 @@ from langchain.text_splitter import (
     RecursiveCharacterTextSplitter,
 )
 import logging
-import openai as openai_client
 import pandas as pd
 import requests
 import unicodedata
@@ -24,12 +32,11 @@ logger = logging.getLogger("airflow.task")
 edgar_headers={"User-Agent": "test1@test1.com"}
 
 pgvector_hook = PgVectorHook("postgres_default")
-openai_hook = OpenAIHook("openai_default")
-openai_client.api_key = openai_hook._get_api_key()
+
+cohere_hook = CohereHook("cohere_default")
+cohere_client = cohere_hook.get_conn
 
 table_names=["tenq", "tenq_summary"]
-
-tickers = ["f", "tsla"]
 
 default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
 
@@ -40,8 +47,16 @@ default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
     catchup=False,
     is_paused_upon_creation=True,
     default_args=default_args,
+    params={
+        "ticker": Param(
+            "",
+            title="Ticker symbol from a US-listed public company.",
+            type="string",
+            description="US-listed companies can be found at https://www.sec.gov/file/company-tickers"
+        )
+    }
 )
-def FinSum_PgVector():
+def FinSum_PgVector(ticker: str = None):
     """
     This DAG extracts and splits financial reporting data from the US 
     [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and ingests 
@@ -78,15 +93,15 @@ def FinSum_PgVector():
                 columns=[
                     "id UUID PRIMARY KEY",
                     "docLink TEXT",
-                    "ticker TEXT",
-                    "cik_number TEXT",
-                    "fiscal_year TEXT",
-                    "fiscal_period TEXT",
-                    "vector VECTOR(1536)"
+                    "tickerSymbol TEXT",
+                    "cikNumber TEXT",
+                    "fiscalYear TEXT",
+                    "fiscalPeriod TEXT",
+                    "vector VECTOR(768)"
                 ]   
             )
 
-    def remove_tables(content:str):
+    def remove_html_tables(content:str):
         """
         Remove all "table" tags from html content leaving only text.
 
@@ -115,7 +130,7 @@ def FinSum_PgVector():
         if content.ok:
             content_type = content.headers['Content-Type']
             if content_type == 'text/html':
-                content = remove_tables(content.text)
+                content = remove_html_tables(content.text)
             else:
                 logger.warning(f"Unsupported content type ({content_type}) for doc {doc_link}.  Skipping.")
                 content = None
@@ -163,6 +178,8 @@ def FinSum_PgVector():
         :return: A dataframe
         """
 
+        logger.info(f"Extracting documents for ticker {ticker}.")
+
         company_list = requests.get(
             url="https://www.sec.gov/files/company_tickers.json", 
             headers=edgar_headers)
@@ -206,10 +223,10 @@ def FinSum_PgVector():
             link_10q = get_10q_link(accn=form.get("accn"), cik_number=cik_number)
             docs.append({
                 "docLink": link_10q, 
-                "ticker": ticker,
-                "cik_number": cik_number,
-                "fiscal_year": form.get("fy"), 
-                "fiscal_period": form.get("fp")
+                "tickerSymbol": ticker,
+                "cikNumber": cik_number,
+                "fiscalYear": form.get("fy"), 
+                "fiscalPeriod": form.get("fp")
                 })
             
         df = pd.DataFrame(docs)
@@ -221,20 +238,18 @@ def FinSum_PgVector():
         
         return df
 
-    def split(dfs: list[pd.DataFrame]) -> pd.DataFrame:
+    def split(df: pd.DataFrame) -> pd.DataFrame:
         """
         This task concatenates multiple dataframes from upstream dynamic tasks and splits the content 
         first with an html splitter and then with a text splitter.
 
-        :param dfs: A list of dataframes from downstream dynamic tasks
+        :param df: A dataframe from an upstream extract task
         :return: A dataframe 
         """
 
         headers_to_split_on = [
             ("h2", "h2"),
         ]
-
-        df = pd.concat(dfs, axis=0, ignore_index=True)
 
         html_splitter = HTMLHeaderTextSplitter(headers_to_split_on)
         text_splitter = RecursiveCharacterTextSplitter(
@@ -257,98 +272,92 @@ def FinSum_PgVector():
 
         return df
 
-    def pgvector_ingest(
-        dfs: list[pd.DataFrame],
-        table_name: str
-    ):
+    def pgvector_ingest(df: pd.DataFrame, content_column_name: str, table_name: str):
         """
         This task concatenates multiple dataframes from upstream dynamic tasks and vectorizes 
         with import to a pgvector database.
 
-        :param dfs: A list of dataframes from downstream dynamic tasks
+        :param df: A dataframe from an upstream split task
+        :param content_column_name: The name of the column with text to embed and ingest
         :param index_name: The name of the index to import data. 
         """
 
-        df = pd.concat(dfs, ignore_index=True)
-
-        df["id"] = df.content.apply(
+        df["id"] = df[content_column_name].apply(
             lambda x: str(uuid.uuid5(
                 name=x, namespace=uuid.NAMESPACE_DNS)
             )
         )
 
-        df["vector"] = df.content.apply(
-            lambda x: list(
-                openai_hook.create_embeddings(
-                    text=x, model="text-embedding-ada-002")
-                )
+        df["vector"] = df[content_column_name].apply(
+            lambda x: cohere_hook.create_embeddings(
+                texts=[x], model="embed-multilingual-v2.0"
+                )[0]
             )
         
-        df.drop('content', axis=1).to_sql(
+        df.drop(content_column_name, axis=1).to_sql(
             name=table_name, 
             con=pgvector_hook.get_sqlalchemy_engine(), 
             if_exists='replace', 
             chunksize=1000
         )
         
-    def chunk_summarization_openai(content: str, fy: str, fp: str) -> str:
+    def chunk_summarization_cohere(content: str, ticker: str, fy: str, fp: str) -> str:
+        """
+        This function uses Cohere's "Summarize" endpoint to summarize a chunk of text.
+
+        :param content: The text content to be summarized.
+        :param ticker: The company ticker symbol for (status printing).
+        :param fy: The fiscal year of the document chunk for (status printing).
+        :param fp: The fiscal period of the document chunk for (status printing).
+        :return: A summary string
+        """
+        logger.info(f"Summarizing chunk for ticker {ticker} {fy}:{fp}")
         
-        logger.info(f"Summarizing chunk for {fy}:{fp}")
-        
-        response = openai_client.ChatCompletion().create(
-            model="gpt-3.5-turbo-1106",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a highly skilled AI trained in language comprehension and summarization. I would like you to read the following text and summarize it into a concise abstract paragraph. Aim to retain the most important points, providing a coherent and readable summary that could help a person understand the main points of the discussion without needing to read the entire text. Please avoid unnecessary details or tangential points."
-                },
-                {
-                    "role": "user",
-                    "content": content
-                }
-            ],
-            temperature=0,
-            max_tokens=1000
-            )
-        if content:=response.get("choices")[0].get("message").get("content"):
-            return content
-        else:
-            return None
-    
-    def doc_summarization_openai(content: str, doc_link: str) -> str:
-        
+        return cohere_client.summarize(
+            text=content,
+            model="command",
+            length="long",
+            extractiveness="medium",
+            temperature=1,
+            format="paragraph"
+        ).summary
+   
+    def doc_summarization_cohere(content: str, doc_link: str) -> str:
+        """
+        This function uses Cohere's "Summarize" endpoint to summarize a concatenation 
+        of chunk summaries.
+
+        :param content: The text content to be summarized.
+        :param doc_link: The URL of the document being summarized (status printing).
+        :return: A summary string
+        """
+
         logger.info(f"Summarizing document for {doc_link}")
 
-        response = openai_client.ChatCompletion().create(
-            model="gpt-4-1106-preview",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a highly skilled AI trained in language comprehension and summarization. I would like you to read the following text and summarize it into a concise abstract paragraph. Aim to retain the most important points, providing a coherent and readable summary that could help a person understand the main points of the discussion without needing to read the entire text. Please avoid unnecessary details or tangential points."
-                },
-                {
-                    "role": "user",
-                    "content": content
-                }
-            ],
-            temperature=0,
-            max_tokens=1000
-            )
-        if content:=response.get("choices")[0].get("message").get("content"):
-            return content
-        else:
-            return None
+        return cohere_client.summarize(
+            text=content,
+            model="command",
+            length="long",
+            extractiveness="medium",
+            temperature=1,
+            format="paragraph"
+        ).summary
         
-    def summarize_openai(dfs: [pd.DataFrame]) -> pd.DataFrame:
+    def summarize_cohere(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        This task uses cohere to recursively summarize extracted documents. First the individual
+        chunks of the document are summarized.  Then the collection of chunk summaries are summarized.
 
-        df = pd.concat(dfs, ignore_index=True)
-
-        df["chunk_summary"] = df.apply(lambda x: chunk_summarization_openai(
-            content=x.content, fy=x.fiscal_year, fp=x.fiscal_period), axis=1)
+        :param df: A Pandas dataframe from upstream split tasks
+        :return: A Pandas dataframe with summaries for ingest to a vector DB.
+        """
+        df["chunk_summary"] = df.apply(lambda x: chunk_summarization_cohere(
+            content=x.content, fy=x.fiscalYear, fp=x.fiscalPeriod, ticker=x.tickerSymbol), 
+            axis=1)
 
         summaries_df = df.groupby("docLink").chunk_summary.apply("\n".join).reset_index()
 
-        summaries_df["summary"] = summaries_df.apply(lambda x: doc_summarization_openai(
+        summaries_df["summary"] = summaries_df.apply(lambda x: doc_summarization_cohere(
             content=x.chunk_summary, doc_link=x.docLink), axis=1)
         
         summaries_df.drop("chunk_summary", axis=1, inplace=True)
@@ -361,20 +370,18 @@ def FinSum_PgVector():
 
     _create_index = task(create_tables)()
 
-    edgar_docs = task(extract).expand(ticker=tickers)
+    edgar_docs = task(extract)(ticker=ticker)
 
-    split_docs = task(split).expand(dfs=[edgar_docs])
+    split_docs = task(split)(df=edgar_docs)
 
-    task(pgvector_ingest, task_id="ingest_chunks", retries=10)\
-        .partial(table_name=table_names[0])\
-        .expand(dfs=[split_docs])
+    task(pgvector_ingest, task_id="ingest_chunks")(
+        table_name=table_names[0], content_column_name="content", df=split_docs)
     
-    generate_summary = task(summarize_openai).expand(dfs=[split_docs])
+    generate_summary = task(summarize_cohere)(df=split_docs)
 
-    task(pgvector_ingest, task_id="ingest_summaries", retries=10)\
-        .partial(table_name=table_names[0])\
-        .expand(dfs=[generate_summary])
+    task(pgvector_ingest, task_id="ingest_summaries")(
+        table_name=table_names[1], content_column_name="summary", df=generate_summary)
 
     _check_index >> _create_index >> edgar_docs
 
-FinSum_PgVector()
+FinSum_PgVector(ticker="")

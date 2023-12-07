@@ -1,8 +1,8 @@
 from airflow.providers.weaviate.hooks.weaviate import WeaviateHook
-from airflow.providers.openai.hooks.openai import OpenAIHook
+# from airflow.providers.openai.hooks.openai import OpenAIHook
 from datetime import datetime
 import json
-import openai as openai_client
+# import openai as openai_client
 from pathlib import Path
 from PIL import Image
 import requests
@@ -10,8 +10,8 @@ import streamlit as st
 from time import sleep
 from textwrap import dedent
 
-weaviate_hook = WeaviateHook("weaviate_default")
-openai_hook = OpenAIHook("openai_default")
+WEAVIATE_CONN_ID = "weaviate_default"
+OPENAI_CONN_ID = "openai_default"
 
 edgar_headers={"User-Agent": "test1@test1.com"}
 
@@ -28,16 +28,16 @@ webserver_password = "admin"
 st.set_page_config(layout="wide")
 
 if "weaviate_client" not in st.session_state:
-    weaviate_client = weaviate_hook.get_client()
+    weaviate_client = WeaviateHook(WEAVIATE_CONN_ID).get_client()
     st.session_state["weaviate_client"] = weaviate_client
 else:
     weaviate_client = st.session_state["weaviate_client"]
 
-if "openai_client" not in st.session_state:
-    openai_client.api_key = openai_hook._get_api_key()
-    st.session_state["openai_client"] = openai_client
-else:
-    openai_client = st.session_state["openai_client"]
+# if "openai_client" not in st.session_state:
+#     openai_client.api_key = OpenAIHook(OPENAI_CONN_ID)._get_api_key()
+#     st.session_state["openai_client"] = openai_client
+# else:
+#     openai_client = st.session_state["openai_client"]
 
 if "company_list" not in st.session_state:
     company_list = requests.get(
@@ -286,16 +286,15 @@ with ingest_tab:
 
                     if state in ["running", "queued"]:
                         st.markdown(dedent(f"""
-                            Document ingest runnging for ticker {company_to_ingest["ticker"]}. 
-                            Check status in the [Airflow webserver]({link})
-                            ⚠️ Do not refresh your browser."""))
+                            Document ingest runnging for ticker {company_to_ingest["ticker"]}. \n
+                            Check status in the [Airflow webserver]({link})"""))
+                        st.write("⚠️ Do not refresh your browser.")
                     else:
-                        raise Exception(f"Ingest not running: {state}")
+                        st.error(f"Ingest not running: {state}")
                     
                     with st.spinner():
             
                         while state in ["running", "queued"]:
-                            print(state)
                             sleep(5)
 
                             status = requests.get(url=status_link,
@@ -307,17 +306,17 @@ with ingest_tab:
                             if status.ok:
                                 state = json.loads(status.content).get("state")
                             else:
-                                raise Exception(status.reason)
+                                st.error(status.reason)
                         
                     if state == "success":
                         st.success(dedent(f"""
                             Ingest complete for ticker {company_to_ingest['ticker']}. 
                             Please refresh your browser."""))
                     else:
-                        raise Exception(f"Ingest failed: state {state}")
+                        st.error(f"Ingest failed: state {state}")
                 
                 else:
-                    raise Exception(status.reason)
+                    st.error(f"Ingest failed: state {status.reason}")
                     
             else:
-                raise Exception(response.reason)
+                st.error(f"Could not start DAG: {response.reason}")

@@ -1,3 +1,11 @@
+"""
+## Summarize and search financial documents using OpenAI's LLMs and Pinecone vector database
+
+This DAG extracts and splits financial reporting data from the US 
+[Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and 
+ingests the data to a Pinecone vector database for generative question answering.  The DAG 
+also creates and vectorizes summarizations of the 10-Q document using OpenAI completions.
+"""
 from __future__ import annotations
 
 from airflow.decorators import dag, task
@@ -37,11 +45,11 @@ default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
     schedule_interval=None,
     start_date=datetime.datetime(2023, 9, 27),
     catchup=False,
-    is_paused_upon_creation=False,
+    is_paused_upon_creation=True,
     default_args=default_args,
     params={
         "ticker": Param(
-            "",
+            default="",
             title="Ticker symbol from a US-listed public company.",
             type="string",
             description="US-listed companies can be found at https://www.sec.gov/file/company-tickers"
@@ -51,9 +59,9 @@ default_args = {"retries": 3, "retry_delay": 30, "trigger_rule": "none_failed"}
 def FinSum_Pinecone(ticker: str = None):
     """
     This DAG extracts and splits financial reporting data from the US 
-    [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and ingests 
-    the data to a Pinecone vector database for generative question answering.  The DAG also 
-    creates and vectorizes summarizations of the 10-Q document.
+    [Securities and Exchanges Commision (SEC) EDGAR database](https://www.sec.gov/edgar) and 
+    ingests the data to a Pinecone vector database for generative question answering.  The DAG 
+    also creates and vectorizes summarizations of the 10-Q document.
     """
 
     def check_indexes() -> [str]:
@@ -87,7 +95,7 @@ def FinSum_Pinecone(ticker: str = None):
                     source_collection='',
                 )
 
-    def remove_tables(content:str):
+    def remove_html_tables(content:str):
         """
         Remove all "table" tags from html content leaving only text.
 
@@ -116,7 +124,7 @@ def FinSum_Pinecone(ticker: str = None):
         if content.ok:
             content_type = content.headers['Content-Type']
             if content_type == 'text/html':
-                content = remove_tables(content.text)
+                content = remove_html_tables(content.text)
             else:
                 logger.warning(f"Unsupported content type ({content_type}) for doc {doc_link}.  Skipping.")
                 content = None
@@ -258,21 +266,22 @@ def FinSum_Pinecone(ticker: str = None):
 
         return df
 
-    def pinecone_ingest(df: pd.DataFrame, index_name: str):
+    def pinecone_ingest(df: pd.DataFrame, content_column_name: str, index_name: str):
         """
         This task concatenates multiple dataframes from upstream dynamic tasks and vectorizes 
         with import to pinecone.
 
         :param df: A dataframe from an upstream split task
+        :param content_column_name: The name of the column with text to embed and ingest
         :param index_name: The name of the index to import data. 
         """
 
-        df["metadata"] = df.drop(["content"], axis=1).to_dict('records')
+        df["metadata"] = df.drop([content_column_name], axis=1).to_dict('records')
 
-        df["id"] = df.content.apply(lambda x: str(uuid.uuid5(name=x+index_name, 
+        df["id"] = df[content_column_name].apply(lambda x: str(uuid.uuid5(name=x+index_name, 
                                                              namespace=uuid.NAMESPACE_DNS)))
 
-        df["values"] = df.content.apply(
+        df["values"] = df[content_column_name].apply(
             lambda x: openai_hook.create_embeddings(text=x, 
                                                     model="text-embedding-ada-002"))
         
@@ -380,12 +389,18 @@ def FinSum_Pinecone(ticker: str = None):
 
     split_docs = task(split)(df=edgar_docs)
     
-    task(pinecone_ingest, task_id="import_chunks")(index_name=index_names[0], df=split_docs)
+    task(pinecone_ingest, task_id="import_chunks")(
+        index_name=index_names[0], 
+        content_column_name="content",
+        df=split_docs)
 
     generate_summary = task(summarize_openai)(df=split_docs)
 
-    task(pinecone_ingest, task_id="import_summary")(index_name=index_names[1], df=generate_summary)
+    task(pinecone_ingest, task_id="import_summary")(
+        index_name=index_names[1], 
+        content_column_name="summary",
+        df=generate_summary)
     
     _check_index >> _create_index >> edgar_docs
 
-FinSum_Pinecone()
+FinSum_Pinecone(ticker="")

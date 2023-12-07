@@ -1,0 +1,8 @@
+categories:
+  - AI + Machine Learning
+dags:
+  - path: dags/ingestion/FinSum_weaviate.py
+  - path: dags/ingestion/FinSum_pinecone.py
+  - path: dags/ingestion/FinSum_pgvector.py
+  - path: dags/ingestion/FinSum_openai.py
+  - path: dags/ingestion/FinSum_cohere.py
