@@ -290,7 +290,8 @@ def FinSum_Weaviate(ticker: str = None):
             verbose=True
         )
 
-    def chunk_summarization_openai(content: str, ticker: str, fy: str, fp: str) -> str:
+    def chunk_summarization_openai(
+            openai_client: openai_client, content: str, ticker: str, fy: str, fp: str) -> str:
         """
         This function uses openai gpt-3.5-turbo-1106 to summarize a chunk of text.
 
@@ -300,8 +301,6 @@ def FinSum_Weaviate(ticker: str = None):
         :param fp: The fiscal period of the document chunk for (status printing).
         :return: A summary string
         """
-        
-        openai_client.api_key = OpenAIHook("openai_default")._get_api_key()
 
         logger.info(f"Summarizing chunk for ticker {ticker} {fy}:{fp}")
         
@@ -325,7 +324,8 @@ def FinSum_Weaviate(ticker: str = None):
         else:
             return None
     
-    def doc_summarization_openai(content: str, doc_link: str) -> str:
+    def doc_summarization_openai(
+            openai_client: openai_client, content: str, doc_link: str) -> str:
         """
         This function uses openai gpt-4-1106-preview to summarize a concatenation of
         document chunks.
@@ -334,8 +334,6 @@ def FinSum_Weaviate(ticker: str = None):
         :param doc_link: The URL of the document being summarized (status printing).
         :return: A summary string
         """
-
-        openai_client.api_key = OpenAIHook("openai_default")._get_api_key()
 
         logger.info(f"Summarizing document for {doc_link}")
 
@@ -367,14 +365,22 @@ def FinSum_Weaviate(ticker: str = None):
         :param df: A Pandas dataframe from upstream split tasks
         :return: A Pandas dataframe with summaries for ingest to a vector DB.
         """
+        
+        openai_client.api_key = OpenAIHook("openai_default")._get_api_key()
+
         df["chunk_summary"] = df.apply(lambda x: chunk_summarization_openai(
-            content=x.content, fy=x.fiscalYear, fp=x.fiscalPeriod, ticker=x.tickerSymbol), 
-            axis=1)
+            openai_client=openai_client, 
+            content=x.content, 
+            fy=x.fiscalYear, 
+            fp=x.fiscalPeriod, 
+            ticker=x.tickerSymbol), axis=1)
 
         summaries_df = df.groupby("docLink").chunk_summary.apply("\n".join).reset_index()
 
         summaries_df["summary"] = summaries_df.apply(lambda x: doc_summarization_openai(
-            content=x.chunk_summary, doc_link=x.docLink), axis=1)
+            openai_client=openai_client, 
+            content=x.chunk_summary, 
+            doc_link=x.docLink), axis=1)
         
         summaries_df.drop("chunk_summary", axis=1, inplace=True)
 

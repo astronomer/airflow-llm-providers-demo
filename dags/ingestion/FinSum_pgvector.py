@@ -15,6 +15,7 @@ from airflow.providers.cohere.hooks.cohere import CohereHook
 from airflow.providers.pgvector.hooks.pgvector import PgVectorHook
 
 from bs4 import BeautifulSoup
+from cohere.client import Client as CohereClient
 import datetime
 from langchain.schema import Document
 from langchain.text_splitter import (
@@ -27,14 +28,12 @@ import requests
 import unicodedata
 import uuid
 
+POSTGRES_CONN_ID = "postgres_default"
+COHERE_CONN_ID = "cohere_default"
+
 logger = logging.getLogger("airflow.task")
 
 edgar_headers={"User-Agent": "test1@test1.com"}
-
-pgvector_hook = PgVectorHook("postgres_default")
-
-cohere_hook = CohereHook("cohere_default")
-cohere_client = cohere_hook.get_conn
 
 table_names=["tenq", "tenq_summary"]
 
@@ -68,6 +67,9 @@ def FinSum_PgVector(ticker: str = None):
         """
         Check if tables exists.
         """
+
+        pgvector_hook = PgVectorHook(POSTGRES_CONN_ID)
+
         exists = []
         for table_name in table_names:
             if pgvector_hook.get_records(
@@ -84,6 +86,8 @@ def FinSum_PgVector(ticker: str = None):
             return ["create_tables"]
 
     def create_tables():
+
+        pgvector_hook = PgVectorHook(POSTGRES_CONN_ID)
 
         pgvector_hook.create_extension('vector')
 
@@ -282,6 +286,9 @@ def FinSum_PgVector(ticker: str = None):
         :param index_name: The name of the index to import data. 
         """
 
+        pgvector_hook = PgVectorHook(POSTGRES_CONN_ID)
+        cohere_hook = CohereHook(COHERE_CONN_ID)
+
         df["id"] = df[content_column_name].apply(
             lambda x: str(uuid.uuid5(
                 name=x, namespace=uuid.NAMESPACE_DNS)
@@ -301,7 +308,8 @@ def FinSum_PgVector(ticker: str = None):
             chunksize=1000
         )
         
-    def chunk_summarization_cohere(content: str, ticker: str, fy: str, fp: str) -> str:
+    def chunk_summarization_cohere(
+            cohere_client: CohereClient, content: str, ticker: str, fy: str, fp: str) -> str:
         """
         This function uses Cohere's "Summarize" endpoint to summarize a chunk of text.
 
@@ -311,6 +319,7 @@ def FinSum_PgVector(ticker: str = None):
         :param fp: The fiscal period of the document chunk for (status printing).
         :return: A summary string
         """
+
         logger.info(f"Summarizing chunk for ticker {ticker} {fy}:{fp}")
         
         return cohere_client.summarize(
@@ -322,7 +331,8 @@ def FinSum_PgVector(ticker: str = None):
             format="paragraph"
         ).summary
    
-    def doc_summarization_cohere(content: str, doc_link: str) -> str:
+    def doc_summarization_cohere(
+            cohere_client: CohereClient, content: str, doc_link: str) -> str:
         """
         This function uses Cohere's "Summarize" endpoint to summarize a concatenation 
         of chunk summaries.
@@ -351,14 +361,22 @@ def FinSum_PgVector(ticker: str = None):
         :param df: A Pandas dataframe from upstream split tasks
         :return: A Pandas dataframe with summaries for ingest to a vector DB.
         """
+
+        cohere_client = CohereHook(COHERE_CONN_ID).get_conn
+
         df["chunk_summary"] = df.apply(lambda x: chunk_summarization_cohere(
-            content=x.content, fy=x.fiscalYear, fp=x.fiscalPeriod, ticker=x.tickerSymbol), 
-            axis=1)
+            cohere_client=cohere_client,
+            content=x.content, 
+            fy=x.fiscalYear, 
+            fp=x.fiscalPeriod, 
+            ticker=x.tickerSymbol), axis=1)
 
         summaries_df = df.groupby("docLink").chunk_summary.apply("\n".join).reset_index()
 
         summaries_df["summary"] = summaries_df.apply(lambda x: doc_summarization_cohere(
-            content=x.chunk_summary, doc_link=x.docLink), axis=1)
+            cohere_client=cohere_client,
+            content=x.chunk_summary, 
+            doc_link=x.docLink), axis=1)
         
         summaries_df.drop("chunk_summary", axis=1, inplace=True)
 
