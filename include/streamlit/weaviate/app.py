@@ -7,6 +7,7 @@ from pathlib import Path
 from PIL import Image
 import requests
 import streamlit as st
+from time import sleep
 from textwrap import dedent
 
 weaviate_hook = WeaviateHook("weaviate_default")
@@ -18,6 +19,11 @@ chunk_class = "TenQ"
 summary_class = "TenQSummary"
 
 dag_id="FinSum_Weaviate"
+
+webserver_internal = "http://webserver:8080"
+webserver_public = "http://localhost:8080"
+webserver_username = "admin"
+webserver_password = "admin"
 
 st.set_page_config(layout="wide")
 
@@ -45,8 +51,8 @@ if "company_list" not in st.session_state:
 else:
     company_list = st.session_state["company_list"]
 
-header_image = Image.open(Path(__file__).parent / "logo.png")
-avatar_image = Path(__file__).parent.joinpath("logo.png").as_posix()
+header_image = Image.open(Path(__file__).parent.parent / "logo.png")
+avatar_image = Path(__file__).parent.parent.joinpath("logo.png").as_posix()
 
 try:
     tickers = (
@@ -236,7 +242,8 @@ with ingest_tab:
     st.header("Ingest new financial data")
 
     st.write("""By selecting a company from the list below an Airflow DAG run will be 
-             triggered to extract, embed and summarize financial statements.""")
+             triggered to extract, embed and summarize financial statements. Search 
+             by company name, ticker symbol or CIK number.""")
     
     company_to_ingest = st.selectbox(
         label="Select a company.",
@@ -249,18 +256,68 @@ with ingest_tab:
 
         if st.button(label="Start Ingest"):
 
-            response = requests.post(url=f"http://webserver:8080/api/v1/dags/{dag_id}/dagRuns",
-                        headers={"Content-Type": "application/json"},
-                        auth=requests.auth.HTTPBasicAuth('admin', 'admin'),
-                        data=f'{{"conf":  {{"run_date": "{datetime.now()}", "ticker": "{company_to_ingest["ticker"]}"}} }}'
-                        )
+            response = requests.post(
+                url=f"{webserver_internal}/api/v1/dags/{dag_id}/dagRuns",
+                headers={"Content-Type": "application/json"},
+                auth=requests.auth.HTTPBasicAuth(
+                    webserver_username, webserver_password),
+                data=json.dumps({
+                    "conf":  {
+                        "run_date": str(datetime.now()), 
+                        "ticker": company_to_ingest["ticker"]
+                        }
+                    })
+                )
             
             if response.ok:
                 run_id = json.loads(response.text)['dag_run_id']
-                link = f"http://localhost:8080/dags/{dag_id}/grid?dag_run_id={run_id}&tab=graph"
+                link = f"{webserver_public}/dags/{dag_id}/grid?dag_run_id={run_id}&tab=graph"
+                status_link = f"{webserver_internal}/api/v1/dags/{dag_id}/dagRuns/{run_id}"
+                    
+                status = requests.get(
+                    url=status_link,
+                    headers={"Content-Type": "application/json"},
+                    auth=requests.auth.HTTPBasicAuth(
+                        webserver_username, webserver_password),
+                    )
 
-                st.markdown(f"Document ingest has started. Follow progress in the [Airflow webserver]({link})")
-                st.write(f"⚠️ After ingest has completed restart the FinSum App.")
+                if status.ok:
+                    state = json.loads(status.content).get("state")
+
+                    if state in ["running", "queued"]:
+                        st.markdown(dedent(f"""
+                            Document ingest runnging for ticker {company_to_ingest["ticker"]}. 
+                            Check status in the [Airflow webserver]({link})
+                            ⚠️ Do not refresh your browser."""))
+                    else:
+                        raise Exception(f"Ingest not running: {state}")
+                    
+                    with st.spinner():
+            
+                        while state in ["running", "queued"]:
+                            print(state)
+                            sleep(5)
+
+                            status = requests.get(url=status_link,
+                                headers={"Content-Type": "application/json"},
+                                auth=requests.auth.HTTPBasicAuth(
+                                    webserver_username, webserver_password),
+                                )
+                            
+                            if status.ok:
+                                state = json.loads(status.content).get("state")
+                            else:
+                                raise Exception(status.reason)
+                        
+                    if state == "success":
+                        st.success(dedent(f"""
+                            Ingest complete for ticker {company_to_ingest['ticker']}. 
+                            Please refresh your browser."""))
+                    else:
+                        raise Exception(f"Ingest failed: state {state}")
+                
+                else:
+                    raise Exception(status.reason)
+                    
             else:
                 raise Exception(response.reason)
-
