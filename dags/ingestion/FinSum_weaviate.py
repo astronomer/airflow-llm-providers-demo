@@ -70,7 +70,7 @@ def FinSum_Weaviate(ticker: str = None):
         class_objects = get_schema()
 
         return (
-            ["extract"]
+            ["extract_10q"]
             if weaviate_hook.check_schema(class_objects=class_objects)
             else ["create_schemas"]
         )

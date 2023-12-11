@@ -62,7 +62,7 @@ def FinSum_Pinecone(ticker: str = None):
         pinecone_hook = PineconeHook(PINECONE_CONN_ID)
         
         if set(index_names).issubset(set(pinecone_hook.list_indexes())):
-                return ["extract"]
+                return ["extract_10q"]
         else:
             return ["create_indexes"]
 

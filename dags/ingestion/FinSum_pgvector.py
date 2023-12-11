@@ -72,7 +72,7 @@ def FinSum_PgVector(ticker: str = None):
                 exists.append(False)
             
         if all(exists):
-            return ["extract"]
+            return ["extract_10q"]
         else:
             return ["create_tables"]
 
